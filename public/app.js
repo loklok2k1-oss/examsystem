@@ -76,7 +76,7 @@ async function renderAuth() {
   const first = !boot.configured;
   app.innerHTML = '<main><div class="card" style="max-width:520px;margin:40px auto"><h2>考試系統</h2>' +
     (first ? '<p class="muted">首次開啟，請先建立管理員帳號，之後考生可以自行註冊。</p>' : '<p class="muted">VTS 同 430 備考系統，請登入或者註冊。</p>') +
-    '<div id="authTabs"><button class="primary" id="tabLogin">登入</button> ' + (first ? '' : '<button id="tabReg">註冊</button>') + ' <button id="themeBtn">🌙 深色 / 淺色</button></div>' +
+    '<div id="authTabs"><button id="tabLogin">登入</button> <button id="tabReg">' + (first ? '建立管理員' : '註冊') + '</button> <button id="themeBtn">🌙 深色 / 淺色</button></div>' +
     '<div id="authForm"></div><p id="authMsg" class="muted"></p></div></main>';
   document.getElementById("themeBtn").addEventListener("click", toggleTheme);
   const formEl = document.getElementById("authForm");
@@ -90,7 +90,7 @@ async function renderAuth() {
     });
   }
   function drawReg() {
-    formEl.innerHTML = '<label>帳號</label><input id="aUser" autocomplete="username"><label>密碼（至少 4 個字）</label><input id="aPass" type="password" autocomplete="new-password"><label>確認密碼</label><input id="aPass2" type="password" autocomplete="new-password"><button class="primary" id="aGo">註冊並登入</button>';
+    formEl.innerHTML = '<label>帳號</label><input id="aUser" autocomplete="username"><label>密碼（至少 4 個字）</label><input id="aPass" type="password" autocomplete="new-password"><label>確認密碼</label><input id="aPass2" type="password" autocomplete="new-password"><button class="primary" id="aGo">' + (first ? '建立管理員並登入' : '註冊並登入') + '</button>';
     document.getElementById("aGo").addEventListener("click", async () => {
       const p1 = document.getElementById("aPass").value, p2 = document.getElementById("aPass2").value;
       if (p1 !== p2) { document.getElementById("authMsg").textContent = "兩次密碼唔一致。"; return; }
@@ -100,10 +100,14 @@ async function renderAuth() {
       } catch (e) { document.getElementById("authMsg").textContent = e.message; }
     });
   }
-  drawLogin();
-  const tabReg = document.getElementById("tabReg");
-  if (tabReg) tabReg.addEventListener("click", drawReg);
-  document.getElementById("tabLogin").addEventListener("click", drawLogin);
+  function setTab(which) {
+    document.getElementById("tabLogin").className = which === "login" ? "primary" : "";
+    document.getElementById("tabReg").className = which === "reg" ? "primary" : "";
+  }
+  // 首次開啟（資料庫未有任何帳號）預設顯示建立管理員，唔係登入——否則登入一定失敗，死結。
+  if (first) { drawReg(); setTab("reg"); } else { drawLogin(); setTab("login"); }
+  document.getElementById("tabReg").addEventListener("click", () => { drawReg(); setTab("reg"); });
+  document.getElementById("tabLogin").addEventListener("click", () => { drawLogin(); setTab("login"); });
 }
 
 // ---------- 主畫面 ----------
