@@ -42,7 +42,32 @@ async function api(path, opts) {
   if (!res.ok) throw new Error(data.error || ("請求失敗（" + res.status + "）。"));
   return data;
 }
-function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
+
+// ---------- 下載檔案（CSV / JSON 備份用）：帶登入 token，唔經 api() 因為要拎 blob ----------
+async function downloadFile(path, fallbackName) {
+  const token = storage.get("exam_token");
+  const headers = {};
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const res = await fetch(path, { headers });
+  if (!res.ok) {
+    let msg = "下載失敗（" + res.status + "）。";
+    try { const d = await res.json(); if (d.error) msg = d.error; } catch (e) {}
+    throw new Error(msg);
+  }
+  const blob = await res.blob();
+  let name = fallbackName || "download";
+  const cd = res.headers.get("Content-Disposition") || "";
+  const mm = cd.match(/filename="?([^";]+)"?/);
+  if (mm) name = mm[1];
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
 
 // ---------- 狀態 ----------
 let me = null;
@@ -90,7 +115,7 @@ async function renderAuth() {
     });
   }
   function drawReg() {
-    formEl.innerHTML = '<label>帳號</label><input id="aUser" autocomplete="username"><label>密碼（至少 4 個字）</label><input id="aPass" type="password" autocomplete="new-password"><label>確認密碼</label><input id="aPass2" type="password" autocomplete="new-password"><button class="primary" id="aGo">' + (first ? '建立管理員並登入' : '註冊並登入') + '</button>';
+    formEl.innerHTML = '<label>帳號</label><input id="aUser" autocomplete="username"><label>密碼（至少 6 個字）</label><input id="aPass" type="password" autocomplete="new-password"><label>確認密碼</label><input id="aPass2" type="password" autocomplete="new-password"><button class="primary" id="aGo">' + (first ? '建立管理員並登入' : '註冊並登入') + '</button>';
     document.getElementById("aGo").addEventListener("click", async () => {
       const p1 = document.getElementById("aPass").value, p2 = document.getElementById("aPass2").value;
       if (p1 !== p2) { document.getElementById("authMsg").textContent = "兩次密碼唔一致。"; return; }
@@ -148,7 +173,7 @@ function openModal(html) {
 function escClose(e) { if (e.key === "Escape") closeModal(); }
 function closeModal() { const r = document.getElementById("modalRoot"); if (r) r.innerHTML = ""; document.removeEventListener("keydown", escClose); }
 function openChangePw() {
-  openModal('<h2>改密碼</h2><label>舊密碼</label><input id="oldPw" type="password"><label>新密碼</label><input id="newPw" type="password"><p><button class="primary" id="pwGo">儲存</button> <button id="pwCancel">取消</button></p><p id="pwMsg" class="muted"></p>');
+  openModal('<h2>改密碼</h2><label>舊密碼</label><input id="oldPw" type="password"><label>新密碼（至少 6 個字）</label><input id="newPw" type="password"><p><button class="primary" id="pwGo">儲存</button> <button id="pwCancel">取消</button></p><p id="pwMsg" class="muted"></p>');
   document.getElementById("pwCancel").addEventListener("click", closeModal);
   document.getElementById("pwGo").addEventListener("click", async () => {
     try { await api("/api/auth/change-password", { method: "POST", body: { oldPassword: document.getElementById("oldPw").value, newPassword: document.getElementById("newPw").value } }); closeModal(); alert("密碼已改。"); }
@@ -163,6 +188,11 @@ function qCard(q, showAnswer) {
 }
 
 // ---------- 儀表板 ----------
+let lastRestoreResult = null;
+function restoreRowsHtml() {
+  if (!lastRestoreResult) return "";
+  return Object.keys(lastRestoreResult).map((t) => { const r = lastRestoreResult[t]; return "<p>• " + esc(t) + "：新增 " + r.inserted + " 行，更新 " + r.updated + " 行，跳過 " + r.skipped + " 行</p>"; }).join("");
+}
 async function viewDashboard() {
   const m = mainEl();
   const stats = await api("/api/stats/me");
@@ -176,7 +206,14 @@ async function viewDashboard() {
       '<div class="stat"><div class="k">留言總數</div><div class="v">' + a.comments + '</div></div></div>' +
       '<h3>題型分佈：' + a.byType.map((x) => esc(x.type) + " " + x.n).join("、") + '</h3>' +
       '<h3>難度分佈：' + a.byDifficulty.map((x) => esc(x.difficulty) + " " + x.n).join("、") + '</h3>' +
-      '<h3>各考試題目分佈</h3>' + (a.byExam.length === 0 ? '<p class="muted">題庫暫時係空。</p>' : a.byExam.map((x) => '<div class="bar-row"><div class="lbl"><span>' + esc(x.exam) + '</span><span>' + x.n + ' 題</span></div><div class="bar blue"><div style="width:' + Math.max(4, Math.round((x.n / maxN) * 100)) + '%"></div></div></div>').join("")) + '</div>';
+      '<h3>各考試題目分佈</h3>' + (a.byExam.length === 0 ? '<p class="muted">題庫暫時係空。</p>' : a.byExam.map((x) => '<div class="bar-row"><div class="lbl"><span>' + esc(x.exam) + '</span><span>' + x.n + ' 題</span></div><div class="bar blue"><div style="width:' + Math.max(4, Math.round((x.n / maxN) * 100)) + '%"></div></div></div>').join("")) + '</div>' +
+      '<div class="card"><h2>備份與匯出（管理員）</h2>' +
+      '<p><button id="bkQ">⬇ 匯出題目 CSV（全部）</button> <button id="bkU">⬇ 匯出學生帳號 CSV</button> <button id="bkAll" class="primary">⬇ 下載成站備份 JSON</button></p>' +
+      '<p class="muted">題目 CSV 格式同匯入範本一樣，可以直接用嚟備份或者搬去另一部機。學生帳號 CSV 唔包含密碼雜湊。成站備份 JSON 包晒題目、帳號、成績、答題紀錄、留言、收藏同登入狀態。</p>' +
+      '<p class="muted">⚠️ 備份檔包含密碼雜湊，唔好公開分享，妥善保存。遺失咗人哋攞到就可以離線慢慢試密碼。</p>' +
+      '<p><label>還原備份 JSON</label><input type="file" id="rsFile" accept=".json,application/json"><button id="rsGo">還原備份</button></p>' +
+      '<p class="muted">還原用合併方式：按編號 / 帳號逐行新增或者更新，唔會清空現有資料；失敗會成個取消，唔會還原一半。還原前建議先下載一份最新備份。</p>' +
+      '<p id="bkMsg" class="muted">' + (lastRestoreResult ? "上次還原完成，數字如下。" : "") + '</p><div id="bkResult">' + restoreRowsHtml() + '</div></div>';
   }
   const trend = stats.trend.map((t) => esc(t.title) + "：" + t.score + "/" + t.total_questions).join("、") || "暫時未完成任何模擬考。";
   m.innerHTML = '<h2>我嘅學習概況</h2><div class="grid4">' +
@@ -190,6 +227,25 @@ async function viewDashboard() {
   document.getElementById("goP").addEventListener("click", () => showView("practice"));
   document.getElementById("goE").addEventListener("click", () => showView("exam"));
   document.getElementById("goW").addEventListener("click", () => showView("wrong"));
+  // 備份與匯出（管理員先見到）
+  const bkQ = document.getElementById("bkQ");
+  if (bkQ) {
+    bkQ.addEventListener("click", async () => { try { await downloadFile("/api/admin/export/questions", "questions.csv"); } catch (e) { document.getElementById("bkMsg").textContent = e.message; } });
+    document.getElementById("bkU").addEventListener("click", async () => { try { await downloadFile("/api/admin/export/users", "users.csv"); } catch (e) { document.getElementById("bkMsg").textContent = e.message; } });
+    document.getElementById("bkAll").addEventListener("click", async () => { try { await downloadFile("/api/admin/backup", "exam-backup.json"); } catch (e) { document.getElementById("bkMsg").textContent = e.message; } });
+    document.getElementById("rsGo").addEventListener("click", async () => {
+      const f = document.getElementById("rsFile").files[0];
+      if (!f) { document.getElementById("bkMsg").textContent = "請先揀一個備份 JSON 檔案。"; return; }
+      let backup;
+      try { backup = JSON.parse(await f.text()); } catch (e) { document.getElementById("bkMsg").textContent = "檔案唔係有效嘅 JSON 格式。"; return; }
+      if (!confirm("確定還原呢個備份？會用合併方式寫入，唔會清空現有資料。建議還原前先下載一份最新備份。")) return;
+      try {
+        const d = await api("/api/admin/restore", { method: "POST", body: { backup } });
+        lastRestoreResult = d.result;
+        showView("dashboard");
+      } catch (e) { document.getElementById("bkMsg").textContent = e.message; }
+    });
+  }
 }
 
 // ---------- 刷題 ----------
@@ -426,7 +482,9 @@ async function showReport(id) {
   const d = await api("/api/exams/" + id + "/report");
   const wrong = d.items.filter((i) => !i.is_correct).length;
   m.innerHTML = '<div class="card"><h2>成績報告：' + esc(d.exam.title) + '</h2><p>總分：' + d.exam.score + ' / ' + d.exam.total_questions + '，答錯 ' + wrong + ' 題' + (d.exam.duration_sec != null ? '，用時 ' + fmtTime(d.exam.duration_sec) : "") + '</p><p><button id="backE">返去模擬考列表</button> <button id="goW2">去錯題本</button></p></div>' +
-    d.items.map((it, i) => '<div class="card"><div><b>' + (it.is_correct ? "✓ 答對" : "✗ 答錯") + '</b> 第 ' + (i + 1) + ' 題</div>' + qCard(it.question, true) + '<p>你嘅答案：' + esc(it.user_answer || "（未答）") + '</p></div>').join("");
+    d.items.map((it, i) => it.deleted
+      ? '<div class="card"><div><b>' + (it.is_correct ? "✓ 答對" : "✗ 答錯") + '</b> 第 ' + (i + 1) + ' 題 · 題目已刪除</div><p class="muted">呢條題目已經喺題庫刪除，題幹同解析睇唔返，成績分數維持不變。</p><p>你嘅答案：' + esc(it.user_answer || "（未答）") + '</p></div>'
+      : '<div class="card"><div><b>' + (it.is_correct ? "✓ 答對" : "✗ 答錯") + '</b> 第 ' + (i + 1) + ' 題</div>' + qCard(it.question, true) + '<p>你嘅答案：' + esc(it.user_answer || "（未答）") + '</p></div>').join("");
   document.getElementById("backE").addEventListener("click", () => showView("exam"));
   document.getElementById("goW2").addEventListener("click", () => showView("wrong"));
 }
@@ -437,7 +495,10 @@ async function viewQuestions() {
   const m = mainEl();
   m.innerHTML = '<div class="card"><h2>題庫管理</h2><div style="display:flex;gap:8px;flex-wrap:wrap"><input id="qSearch" placeholder="關鍵字或者編號" style="flex:2;min-width:160px"><select id="qExamF" style="flex:1"><option value="">全部考試</option></select><select id="qTypeF" style="flex:1"><option value="">全部題型</option><option>單選</option><option>多選</option><option>判斷</option><option>簡答</option></select><select id="qDiffF" style="flex:1"><option value="">全部難度</option><option>簡單</option><option>中等</option><option>困難</option></select></div><p><button class="primary" id="qFilter">篩選</button> <button id="qAdd">新增題目</button> <span id="qMsg" class="muted"></span></p></div>' +
     '<div class="card"><h2>CSV 批次匯入</h2><p><button id="tplDl">⬇ 下載 CSV 範本（含示例）</button> <button id="tplView">睇範本內容</button> <button id="tplCopy">一鍵複製範本</button></p><p class="muted">範本用 exam 欄位，值係 VTS 或者 430，入面有 4 行示例（單選、多選、判斷、簡答各一），匯入前要刪走示例行。匯入同時兼容舊 chapter / 章節欄位名。</p><div id="tplArea"></div><label>直接貼上 CSV 內容</label><textarea id="csvText" placeholder="貼上 CSV 內容，欄位：question_id,type,content,options,answer,explanation,exam,difficulty"></textarea><label>重複編號處理</label><select id="csvMode"><option value="skip">跳過</option><option value="overwrite">覆蓋</option></select><p><button class="primary" id="csvGo">匯入</button> <span id="csvMsg" class="muted"></span></p><div id="csvErr"></div></div>' +
+    '<div class="card"><h2>批量管理</h2><p><button id="selPage">全選今頁</button> <button id="selAll">全選篩選結果</button> <button id="selNone">取消全選</button> <span id="selCount" class="muted">已選 0 題</span></p><p><button id="batchDel" class="danger">批量刪除</button> <button id="batchExam">批量改分類</button> <button id="batchDiff">批量改難度</button> <button id="expQ">⬇ 匯出題目 CSV（目前篩選）</button> <span id="batchMsg" class="muted"></span></p><p class="muted">批量刪除會一併清除呢啲題目嘅答題紀錄、收藏同相關留言；已經喺已完成考卷入面嘅題目，成績報告會顯示「題目已刪除」，分數維持不變。列表一次過顯示全部篩選結果，所以全選今頁同全選篩選結果係同一批題。</p></div>' +
     '<div id="qList"></div>';
+  let qSelected = new Set();
+  let loadedQs = [];
   let exams = [];
   try { exams = (await api("/api/questions/exams")).exams; } catch (e) {}
   const sel = document.getElementById("qExamF");
@@ -458,16 +519,88 @@ async function viewQuestions() {
       loadList();
     } catch (e) { document.getElementById("csvMsg").textContent = e.message; }
   });
+  function updateSelCount() {
+    const el = document.getElementById("selCount");
+    if (el) el.textContent = "已選 " + qSelected.size + " 題";
+  }
+  function currentFilters() {
+    return { q: document.getElementById("qSearch").value, exam: document.getElementById("qExamF").value, type: document.getElementById("qTypeF").value, difficulty: document.getElementById("qDiffF").value };
+  }
+  async function refreshExamOptions() {
+    try {
+      const ex = (await api("/api/questions/exams")).exams;
+      const sel = document.getElementById("qExamF");
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">全部考試</option>' + ex.map((e) => '<option>' + esc(e) + '</option>').join("");
+      if (ex.includes(cur)) sel.value = cur;
+    } catch (e) {}
+  }
   async function loadList() {
-    const q = document.getElementById("qSearch").value, ex = document.getElementById("qExamF").value, ty = document.getElementById("qTypeF").value, df = document.getElementById("qDiffF").value;
-    const d = await api("/api/questions?exam=" + encodeURIComponent(ex) + "&difficulty=" + encodeURIComponent(df) + "&type=" + encodeURIComponent(ty) + "&q=" + encodeURIComponent(q));
+    const f = currentFilters();
+    const d = await api("/api/questions?exam=" + encodeURIComponent(f.exam) + "&difficulty=" + encodeURIComponent(f.difficulty) + "&type=" + encodeURIComponent(f.type) + "&q=" + encodeURIComponent(f.q));
+    loadedQs = d.questions;
     const list = document.getElementById("qList");
+    updateSelCount();
     if (d.questions.length === 0) { list.innerHTML = '<div class="card"><p class="muted">暫時未有題目，請新增或者匯入。</p></div>'; return; }
-    list.innerHTML = d.questions.map((qq) => '<div class="card"><div><span class="pill">' + esc(qq.exam) + '</span><span class="pill">' + esc(qq.type) + '</span><span class="pill">' + esc(qq.difficulty) + '</span><span class="pill">' + esc(qq.question_id) + '</span></div><h3>' + esc(qq.content) + '</h3><p><button data-edit="' + esc(qq.question_id) + '">修改</button> <button data-prev="' + esc(qq.question_id) + '">預覽</button> <button data-del="' + esc(qq.question_id) + '" class="danger">刪除</button></p></div>').join("");
-    list.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", async () => { if (confirm("確定刪除 " + b.dataset.del + "？")) { await api("/api/questions/" + encodeURIComponent(b.dataset.del), { method: "DELETE" }); loadList(); } }));
+    list.innerHTML = d.questions.map((qq) => '<div class="card"><p><label><input type="checkbox" class="qSel" data-id="' + esc(qq.question_id) + '"' + (qSelected.has(qq.question_id) ? " checked" : "") + '> 勾選呢題</label></p><div><span class="pill">' + esc(qq.exam) + '</span><span class="pill">' + esc(qq.type) + '</span><span class="pill">' + esc(qq.difficulty) + '</span><span class="pill">' + esc(qq.question_id) + '</span></div><h3>' + esc(qq.content) + '</h3><p><button data-edit="' + esc(qq.question_id) + '">修改</button> <button data-prev="' + esc(qq.question_id) + '">預覽</button> <button data-del="' + esc(qq.question_id) + '" class="danger">刪除</button></p></div>').join("");
+    list.querySelectorAll(".qSel").forEach((c) => c.addEventListener("change", () => {
+      if (c.checked) qSelected.add(c.dataset.id); else qSelected.delete(c.dataset.id);
+      updateSelCount();
+    }));
+    list.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", async () => { if (confirm("確定刪除 " + b.dataset.del + "？答題紀錄、收藏同相關留言都會一併清除。")) { qSelected.delete(b.dataset.del); await api("/api/questions/" + encodeURIComponent(b.dataset.del), { method: "DELETE" }); await refreshExamOptions(); loadList(); } }));
     list.querySelectorAll("[data-prev]").forEach((b) => b.addEventListener("click", async () => { const dd = await api("/api/questions/" + encodeURIComponent(b.dataset.prev)); openModal(qCard(dd.question, true) + '<p><button id="mClose">關閉</button></p>'); document.getElementById("mClose").addEventListener("click", closeModal); }));
     list.querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", async () => { const dd = await api("/api/questions/" + encodeURIComponent(b.dataset.edit)); openQForm(dd.question); }));
   }
+  function selectedIds() { return Array.from(qSelected); }
+  document.getElementById("selPage").addEventListener("click", () => { loadedQs.forEach((qq) => qSelected.add(qq.question_id)); loadList(); });
+  document.getElementById("selAll").addEventListener("click", async () => {
+    // 列表本身一次過顯示全部篩選結果（冇分頁），所以全選篩選結果即係全選已載入嘅題
+    loadedQs.forEach((qq) => qSelected.add(qq.question_id));
+    loadList();
+  });
+  document.getElementById("selNone").addEventListener("click", () => { qSelected.clear(); loadList(); });
+  document.getElementById("batchDel").addEventListener("click", async () => {
+    const ids = selectedIds();
+    if (ids.length === 0) { document.getElementById("batchMsg").textContent = "請先勾選要刪除嘅題目。"; return; }
+    if (!confirm("確定刪除已選嘅 " + ids.length + " 題？呢啲題目嘅答題紀錄、收藏同相關留言都會一併清除，唔可以復原。")) return;
+    try {
+      const d = await api("/api/questions/batch-delete", { method: "POST", body: { ids } });
+      ids.forEach((id) => qSelected.delete(id));
+      document.getElementById("batchMsg").textContent = "已刪除 " + d.deleted + " 題，一併清除答題紀錄 " + d.answersRemoved + " 條、收藏 " + d.favoritesRemoved + " 個。";
+      await refreshExamOptions();
+      loadList();
+    } catch (e) { document.getElementById("batchMsg").textContent = e.message; }
+  });
+  function openBatchUpdate(field) {
+    const ids = selectedIds();
+    if (ids.length === 0) { document.getElementById("batchMsg").textContent = "請先勾選要修改嘅題目。"; return; }
+    const isExam = field === "exam";
+    openModal('<h2>批量改' + (isExam ? "分類" : "難度") + '</h2><p class="muted">已選 ' + ids.length + ' 題。</p>' +
+      (isExam
+        ? '<label>新分類</label><select id="bVal"><option value="VTS">VTS</option><option value="430">430</option></select>'
+        : '<label>新難度</label><select id="bVal"><option>簡單</option><option>中等</option><option>困難</option></select>') +
+      '<p><button class="primary" id="bGo">確定修改</button> <button id="bCancel">取消</button></p><p id="bMsg" class="muted"></p>');
+    document.getElementById("bCancel").addEventListener("click", closeModal);
+    document.getElementById("bGo").addEventListener("click", async () => {
+      const body = { ids };
+      body[field] = document.getElementById("bVal").value;
+      try {
+        const d = await api("/api/questions/batch-update", { method: "POST", body });
+        closeModal();
+        document.getElementById("batchMsg").textContent = "已更新 " + d.updated + " 題。";
+        await refreshExamOptions();
+        loadList();
+      } catch (e) { document.getElementById("bMsg").textContent = e.message; }
+    });
+  }
+  document.getElementById("batchExam").addEventListener("click", () => openBatchUpdate("exam"));
+  document.getElementById("batchDiff").addEventListener("click", () => openBatchUpdate("difficulty"));
+  document.getElementById("expQ").addEventListener("click", async () => {
+    try {
+      const f = currentFilters();
+      await downloadFile("/api/admin/export/questions?exam=" + encodeURIComponent(f.exam) + "&difficulty=" + encodeURIComponent(f.difficulty) + "&type=" + encodeURIComponent(f.type) + "&q=" + encodeURIComponent(f.q), "questions.csv");
+    } catch (e) { document.getElementById("batchMsg").textContent = e.message; }
+  });
   document.getElementById("qFilter").addEventListener("click", loadList);
   document.getElementById("qAdd").addEventListener("click", () => openQForm(null));
   function openQForm(q) {
@@ -506,7 +639,8 @@ async function viewAccounts() {
   if (me.role !== "admin") { mainEl().innerHTML = '<div class="card"><p>只有管理員先可以用帳號管理。</p></div>'; return; }
   const m = mainEl();
   const d = await api("/api/admin/users");
-  m.innerHTML = '<div class="card"><h2>帳號管理</h2>' + d.users.map((u) => '<p><b>' + esc(u.username) + '</b> · ' + esc(u.role) + ' <button data-role="' + u.user_id + '" data-to="' + (u.role === "admin" ? "user" : "admin") + '">' + (u.role === "admin" ? "降級做考生" : "升級做管理員") + '</button></p>').join("") + '</div>';
+  m.innerHTML = '<div class="card"><h2>帳號管理</h2><p><button id="expU">⬇ 匯出學生帳號 CSV</button> <span id="accMsg" class="muted"></span></p><p class="muted">帳號 CSV 包含帳號、角色、建立日期、答題數同正確率，唔包含密碼雜湊。</p>' + d.users.map((u) => '<p><b>' + esc(u.username) + '</b> · ' + esc(u.role) + ' <button data-role="' + u.user_id + '" data-to="' + (u.role === "admin" ? "user" : "admin") + '">' + (u.role === "admin" ? "降級做考生" : "升級做管理員") + '</button></p>').join("") + '</div>';
+  document.getElementById("expU").addEventListener("click", async () => { try { await downloadFile("/api/admin/export/users", "users.csv"); } catch (e) { document.getElementById("accMsg").textContent = e.message; } });
   m.querySelectorAll("[data-role]").forEach((b) => b.addEventListener("click", async () => {
     try { await api("/api/admin/users/" + b.dataset.role + "/role", { method: "POST", body: { role: b.dataset.to } }); showView("accounts"); }
     catch (e) { alert(e.message); }

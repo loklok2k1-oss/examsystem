@@ -140,6 +140,50 @@ function hideAnswer(q) {
   return c;
 }
 
+// ---------- 交易小工具：出錯就成個 rollback，唔會做一半 ----------
+// 注意：node:sqlite 係同步 API，fn 入面唔可以用 await。
+function withTx(fn) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const r = fn();
+    db.exec("COMMIT");
+    return r;
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch (e2) {}
+    throw e;
+  }
+}
+
+// ---------- 登入次數限制 ----------
+// 同一 IP 加同一帳號，15 分鐘內失敗 5 次就暫時鎖 15 分鐘（返 429），時間到自動解鎖，唔會鎖死。
+// 存喺記憶體，伺服器重啟會清空；管理員帳號一樣受呢個限制，但只係鎖 15 分鐘，唔使人手解鎖。
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILS = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const loginFails = new Map();
+function loginKey(req, username) { return (req.ip || "?") + "\n" + String(username || ""); }
+function loginLockedMinutes(req, username) {
+  const rec = loginFails.get(loginKey(req, username));
+  if (!rec) return 0;
+  const now = Date.now();
+  if (rec.lockedUntil && now < rec.lockedUntil) return Math.ceil((rec.lockedUntil - now) / 60000);
+  if (now - rec.firstAt > LOGIN_WINDOW_MS) { loginFails.delete(loginKey(req, username)); return 0; }
+  return 0;
+}
+function recordLoginFail(req, username) {
+  const key = loginKey(req, username);
+  const now = Date.now();
+  let rec = loginFails.get(key);
+  if (!rec || now - rec.firstAt > LOGIN_WINDOW_MS) rec = { count: 0, firstAt: now, lockedUntil: 0 };
+  rec.count++;
+  if (rec.count >= LOGIN_MAX_FAILS) rec.lockedUntil = now + LOGIN_LOCK_MS;
+  loginFails.set(key, rec);
+}
+function clearLoginFails(req, username) { loginFails.delete(loginKey(req, username)); }
+
+// ---------- 登入狀態有效期：30 日 ----------
+const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
 // ---------- 答案格式驗證 ----------
 // 單選只准一個字母；多選字母自動排序正規化；字母超出選項範圍即報錯；
 // 判斷題答案必須係選項之一。回傳 { ok, normalized, error }
@@ -270,7 +314,15 @@ function saveQuestion(q) {
 
 // ---------- Express ----------
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.disable("x-powered-by");
+app.set("trust proxy", 1); // 經 nginx 反向代理時，req.ip 先至係訪客真實 IP（登入次數限制用）
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
+app.use(express.json({ limit: "20mb" })); // 還原備份 JSON 可能比較大
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(ROOT, "public")));
 
@@ -281,6 +333,12 @@ function getSessionUser(req) {
   if (!token) return null;
   const s = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(token);
   if (!s) return null;
+  // 30 日過期：過期 token 自動失效兼刪除
+  const created = new Date(s.created_at).getTime();
+  if (!isNaN(created) && Date.now() - created > SESSION_MAX_AGE_MS) {
+    db.prepare("DELETE FROM sessions WHERE session_id = ?").run(token);
+    return null;
+  }
   const u = db.prepare("SELECT * FROM users WHERE user_id = ?").get(s.user_id);
   return u ? publicUser(u) : null;
 }
@@ -295,6 +353,8 @@ function requireAdmin(req, res, next) {
   next();
 }
 function createSessionFor(userId) {
+  // 順手清理已過期嘅舊 token，唔等 sessions 表無限變大
+  db.prepare("DELETE FROM sessions WHERE created_at < ?").run(new Date(Date.now() - SESSION_MAX_AGE_MS).toISOString());
   const token = newToken();
   db.prepare("INSERT INTO sessions (session_id, user_id, created_at) VALUES (?,?,?)").run(token, userId, nowIso());
   return token;
@@ -310,7 +370,7 @@ app.post("/api/auth/register", (req, res) => {
   const username = String(req.body.username || "").trim();
   const password = String(req.body.password || "");
   if (!username || !password) return res.status(400).json({ error: "請填寫帳號同密碼。" });
-  if (password.length < 4) return res.status(400).json({ error: "密碼至少要 4 個字。" });
+  if (password.length < 6) return res.status(400).json({ error: "密碼至少要 6 個字。" });
   const total = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
   const role = total === 0 ? "admin" : "user";
   try {
@@ -325,8 +385,14 @@ app.post("/api/auth/register", (req, res) => {
 app.post("/api/auth/login", (req, res) => {
   const username = String(req.body.username || "").trim();
   const password = String(req.body.password || "");
+  const waitMin = loginLockedMinutes(req, username);
+  if (waitMin > 0) return res.status(429).json({ error: "登入失敗太多次，請等 " + waitMin + " 分鐘再試。" });
   const u = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
-  if (!u || !verifyPassword(password, u.password_hash)) return res.status(401).json({ error: "帳號或者密碼唔啱。" });
+  if (!u || !verifyPassword(password, u.password_hash)) {
+    recordLoginFail(req, username);
+    return res.status(401).json({ error: "帳號或者密碼唔啱。" });
+  }
+  clearLoginFails(req, username);
   const token = createSessionFor(u.user_id);
   res.json({ token, user: publicUser(u) });
 });
@@ -340,7 +406,7 @@ app.get("/api/auth/me", requireAuth, (req, res) => res.json({ user: req.user }))
 app.post("/api/auth/change-password", requireAuth, (req, res) => {
   const oldPw = String(req.body.oldPassword || "");
   const newPw = String(req.body.newPassword || "");
-  if (newPw.length < 4) return res.status(400).json({ error: "新密碼至少要 4 個字。" });
+  if (newPw.length < 6) return res.status(400).json({ error: "新密碼至少要 6 個字。" });
   const u = db.prepare("SELECT * FROM users WHERE user_id = ?").get(req.user.user_id);
   if (!u || !verifyPassword(oldPw, u.password_hash)) return res.status(400).json({ error: "舊密碼唔啱。" });
   db.prepare("UPDATE users SET password_hash = ? WHERE user_id = ?").run(hashPassword(newPw), req.user.user_id);
@@ -375,7 +441,8 @@ app.get("/api/questions", requireAuth, (req, res) => {
   if (q) { sql += " AND (content LIKE ? OR question_id LIKE ?)"; params.push("%" + q + "%", "%" + q + "%"); }
   sql += " ORDER BY question_id";
   const rows = db.prepare(sql).all(...params);
-  res.json({ questions: rows.map(rowToQuestion) });
+  // 考生唔可以直接由列表拎到答案：非管理員一律隱藏答案。題庫管理頁本身只限管理員用，唔受影響。
+  res.json({ questions: rows.map((r) => req.user.role === "admin" ? rowToQuestion(r) : hideAnswer(rowToQuestion(r))) });
 });
 app.get("/api/questions/exams", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT DISTINCT exam FROM questions WHERE exam != '' ORDER BY exam").all();
@@ -386,7 +453,7 @@ app.get("/api/questions/template", requireAuth, (req, res) => {
   res.setHeader("Content-Disposition", "attachment; filename=\"exam-template.csv\"");
   res.send("\ufeff" + csvTemplate());
 });
-app.get("/api/questions/:id", requireAuth, (req, res) => {
+app.get("/api/questions/:id", requireAuth, requireAdmin, (req, res) => {
   const r = db.prepare("SELECT * FROM questions WHERE question_id = ?").get(req.params.id);
   if (!r) return res.status(404).json({ error: "搵唔到呢條題目。" });
   res.json({ question: rowToQuestion(r) });
@@ -409,9 +476,59 @@ app.put("/api/questions/:id", requireAuth, requireAdmin, (req, res) => {
   res.json({ question: v.q });
 });
 app.delete("/api/questions/:id", requireAuth, requireAdmin, (req, res) => {
-  db.prepare("DELETE FROM questions WHERE question_id = ?").run(req.params.id);
-  db.prepare("DELETE FROM favorites WHERE question_id = ?").run(req.params.id);
+  // 刪題目一併清理佢嘅答題紀錄、收藏同相關留言，唔留孤兒紀錄
+  withTx(() => {
+    db.prepare("DELETE FROM questions WHERE question_id = ?").run(req.params.id);
+    db.prepare("DELETE FROM answer_records WHERE question_id = ?").run(req.params.id);
+    db.prepare("DELETE FROM favorites WHERE question_id = ?").run(req.params.id);
+    db.prepare("DELETE FROM comments WHERE question_id = ?").run(req.params.id);
+  });
   res.json({ ok: true });
+});
+
+// ---------- 題庫批量管理（管理員） ----------
+app.post("/api/questions/batch-delete", requireAuth, requireAdmin, (req, res) => {
+  const ids = Array.isArray(req.body.ids) ? Array.from(new Set(req.body.ids.map(String).map((s) => s.trim()).filter(Boolean))) : [];
+  if (ids.length === 0) return res.status(400).json({ error: "請先揀要刪除嘅題目。" });
+  if (ids.length > 500) return res.status(400).json({ error: "一次最多刪除 500 題。" });
+  const out = withTx(() => {
+    let deleted = 0, answersRemoved = 0, favoritesRemoved = 0, commentsRemoved = 0;
+    const delQ = db.prepare("DELETE FROM questions WHERE question_id = ?");
+    const delA = db.prepare("DELETE FROM answer_records WHERE question_id = ?");
+    const delF = db.prepare("DELETE FROM favorites WHERE question_id = ?");
+    const delC = db.prepare("DELETE FROM comments WHERE question_id = ?");
+    for (const id of ids) {
+      if (delQ.run(id).changes) deleted++;
+      answersRemoved += delA.run(id).changes;
+      favoritesRemoved += delF.run(id).changes;
+      commentsRemoved += delC.run(id).changes;
+    }
+    return { deleted, answersRemoved, favoritesRemoved, commentsRemoved };
+  });
+  res.json(Object.assign({ ok: true }, out));
+});
+app.post("/api/questions/batch-update", requireAuth, requireAdmin, (req, res) => {
+  const ids = Array.isArray(req.body.ids) ? Array.from(new Set(req.body.ids.map(String).map((s) => s.trim()).filter(Boolean))) : [];
+  if (ids.length === 0) return res.status(400).json({ error: "請先揀要修改嘅題目。" });
+  if (ids.length > 500) return res.status(400).json({ error: "一次最多修改 500 題。" });
+  const exam = req.body.exam != null && String(req.body.exam) !== "" ? String(req.body.exam).trim() : null;
+  const difficulty = req.body.difficulty != null && String(req.body.difficulty) !== "" ? String(req.body.difficulty).trim() : null;
+  if (exam != null && exam !== "VTS" && exam !== "430") return res.status(400).json({ error: "考試只可以係 VTS 或者 430。" });
+  if (difficulty != null && !["簡單", "中等", "困難"].includes(difficulty)) return res.status(400).json({ error: "難度只可以係簡單、中等、困難。" });
+  if (exam == null && difficulty == null) return res.status(400).json({ error: "請揀要改嘅分類或者難度。" });
+  const sets = [];
+  const params = [];
+  if (exam != null) { sets.push("exam = ?"); params.push(exam); }
+  if (difficulty != null) { sets.push("difficulty = ?"); params.push(difficulty); }
+  const out = withTx(() => {
+    const stmt = db.prepare("UPDATE questions SET " + sets.join(", ") + " WHERE question_id = ?");
+    let updated = 0;
+    for (const id of ids) {
+      if (stmt.run(...params, id).changes) updated++;
+    }
+    return { updated };
+  });
+  res.json(Object.assign({ ok: true }, out));
 });
 
 // ---------- CSV 批次匯入 ----------
@@ -632,11 +749,12 @@ app.get("/api/exams/:id/report", requireAuth, (req, res) => {
   const ids = safeJson(rec.question_list, []);
   const items = ids.map((qid) => {
     const r = db.prepare("SELECT * FROM questions WHERE question_id = ?").get(qid);
-    if (!r) return null;
-    const q = rowToQuestion(r);
     const a = byQ[qid];
+    // 題目已經喺題庫刪除：唔好成項消失，要顯示「題目已刪除」，分數同總題數維持不變
+    if (!r) return { deleted: true, question_id: qid, user_answer: a ? a.user_answer : "", is_correct: a ? !!a.is_correct : false };
+    const q = rowToQuestion(r);
     return { question: q, user_answer: a ? a.user_answer : "", is_correct: a ? !!a.is_correct : false };
-  }).filter(Boolean);
+  });
   res.json({ exam: { exam_id: rec.exam_id, title: rec.title, score: rec.score, total_questions: rec.total_questions, duration_sec: rec.duration_sec, start_time: rec.start_time, end_time: rec.end_time }, items });
 });
 app.delete("/api/exams/:id", requireAuth, (req, res) => {
@@ -692,6 +810,180 @@ app.get("/api/stats/admin", requireAuth, requireAdmin, (req, res) => {
   const byDiff = db.prepare("SELECT difficulty, COUNT(*) AS n FROM questions GROUP BY difficulty ORDER BY difficulty").all();
   const byExam = db.prepare("SELECT exam, COUNT(*) AS n FROM questions GROUP BY exam ORDER BY exam").all();
   res.json({ questions: qTotal, users: uTotal, comments: cTotal, byType, byDifficulty: byDiff, byExam });
+});
+
+// ---------- 匯出備份同還原（管理員） ----------
+function dateStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+function sendCsvDownload(res, filename, csvText) {
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="' + filename + '"');
+  res.send("\ufeff" + csvText);
+}
+// 匯出題目 CSV：格式同匯入範本一樣，支援同題庫列表一樣嘅篩選
+app.get("/api/admin/export/questions", requireAuth, requireAdmin, (req, res) => {
+  const { exam, difficulty, type, q } = req.query;
+  let sql = "SELECT * FROM questions WHERE 1=1";
+  const params = [];
+  if (exam) { sql += " AND exam = ?"; params.push(exam); }
+  if (difficulty) { sql += " AND difficulty = ?"; params.push(difficulty); }
+  if (type) { sql += " AND type = ?"; params.push(type); }
+  if (q) { sql += " AND (content LIKE ? OR question_id LIKE ?)"; params.push("%" + q + "%", "%" + q + "%"); }
+  sql += " ORDER BY question_id";
+  const rows = db.prepare(sql).all(...params);
+  const lines = [CSV_HEADERS.join(",")];
+  for (const r of rows) {
+    lines.push([r.question_id, r.type, r.content, safeJson(r.options, []).join("|"), r.answer, r.explanation, r.exam, r.difficulty].map(csvEscape).join(","));
+  }
+  sendCsvDownload(res, "questions-" + dateStamp() + ".csv", lines.join("\n"));
+});
+// 匯出學生帳號 CSV：絕對唔包含密碼雜湊
+app.get("/api/admin/export/users", requireAuth, requireAdmin, (req, res) => {
+  const users = db.prepare("SELECT user_id, username, role, created_at FROM users ORDER BY user_id").all();
+  const lines = [["username", "role", "created_at", "answers", "accuracy"].join(",")];
+  for (const u of users) {
+    const t = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(is_correct),0) AS c FROM answer_records WHERE user_id = ?").get(u.user_id);
+    const acc = t.n ? Math.round((t.c / t.n) * 100) : 0;
+    lines.push([u.username, u.role, u.created_at, t.n, acc + "%"].map(csvEscape).join(","));
+  }
+  sendCsvDownload(res, "users-" + dateStamp() + ".csv", lines.join("\n"));
+});
+// 成站備份 JSON：包晒全部表。users 包含 password_hash，先至還原到帳號密碼不變，
+// 所以呢個檔案係敏感資料，唔可以公開分享，要妥善保存。
+app.get("/api/admin/backup", requireAuth, requireAdmin, (req, res) => {
+  const backup = {
+    app: "exam-system-standalone",
+    version: 1,
+    exported_at: nowIso(),
+    questions: db.prepare("SELECT * FROM questions ORDER BY question_id").all(),
+    users: db.prepare("SELECT * FROM users ORDER BY user_id").all(),
+    exam_records: db.prepare("SELECT * FROM exam_records ORDER BY exam_id").all(),
+    answer_records: db.prepare("SELECT * FROM answer_records ORDER BY record_id").all(),
+    comments: db.prepare("SELECT * FROM comments ORDER BY comment_id").all(),
+    favorites: db.prepare("SELECT * FROM favorites ORDER BY favorite_id").all(),
+    sessions: db.prepare("SELECT * FROM sessions ORDER BY created_at").all(),
+    exam_progress: db.prepare("SELECT * FROM exam_progress ORDER BY exam_id").all(),
+  };
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="exam-backup-' + dateStamp() + '.json"');
+  res.send(JSON.stringify(backup, null, 2));
+});
+// 還原備份 JSON：合併方式（upsert），唔會清空現有資料；
+// 任何一步出錯成個交易 rollback，唔會還原一半。
+app.post("/api/admin/restore", requireAuth, requireAdmin, (req, res) => {
+  const b = req.body && req.body.backup ? req.body.backup : req.body;
+  if (!b || typeof b !== "object" || Array.isArray(b)) return res.status(400).json({ error: "備份檔案格式唔啱，請上載由呢個系統匯出嘅備份 JSON。" });
+  const tables = ["questions", "users", "exam_records", "answer_records", "comments", "favorites", "sessions", "exam_progress"];
+  for (const t of tables) {
+    if (b[t] != null && !Array.isArray(b[t])) return res.status(400).json({ error: "備份檔案入面 " + t + " 唔係列表格式。" });
+  }
+  const result = {};
+  const count = (name) => { if (!result[name]) result[name] = { inserted: 0, updated: 0, skipped: 0 }; return result[name]; };
+  try {
+    withTx(() => {
+      // 題目：按 question_id upsert
+      for (const q of b.questions || []) {
+        const c = count("questions");
+        if (!q || typeof q !== "object" || !q.question_id || !q.type || !q.content || q.answer == null) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM questions WHERE question_id = ?").get(q.question_id);
+        db.prepare("INSERT INTO questions (question_id,type,content,options,answer,explanation,exam,difficulty,created_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(question_id) DO UPDATE SET type=excluded.type, content=excluded.content, options=excluded.options, answer=excluded.answer, explanation=excluded.explanation, exam=excluded.exam, difficulty=excluded.difficulty")
+          .run(q.question_id, q.type, q.content, typeof q.options === "string" ? q.options : JSON.stringify(q.options || []), q.answer, q.explanation || "", q.exam || "", q.difficulty || "中等", q.created_at || nowIso());
+        if (exists) c.updated++; else c.inserted++;
+      }
+      // 帳號：先按 user_id，再按 username；保留原有 user_id，先至唔會斷咗成績紀錄嘅關聯
+      for (const u of b.users || []) {
+        const c = count("users");
+        if (!u || typeof u !== "object" || !u.username || !u.password_hash) { c.skipped++; continue; }
+        const role = u.role === "admin" ? "admin" : "user";
+        const byId = u.user_id != null ? db.prepare("SELECT * FROM users WHERE user_id = ?").get(u.user_id) : null;
+        const byName = db.prepare("SELECT * FROM users WHERE username = ?").get(u.username);
+        if (byId) {
+          if (byName && byName.user_id !== byId.user_id) { c.skipped++; continue; }
+          db.prepare("UPDATE users SET username = ?, password_hash = ?, role = ?, created_at = ? WHERE user_id = ?").run(u.username, u.password_hash, role, u.created_at || nowIso(), u.user_id);
+          c.updated++;
+        } else if (byName) {
+          db.prepare("UPDATE users SET password_hash = ?, role = ?, created_at = ? WHERE user_id = ?").run(u.password_hash, role, u.created_at || byName.created_at, byName.user_id);
+          c.updated++;
+        } else if (u.user_id != null) {
+          db.prepare("INSERT INTO users (user_id, username, password_hash, role, created_at) VALUES (?,?,?,?,?)").run(u.user_id, u.username, u.password_hash, role, u.created_at || nowIso());
+          c.inserted++;
+        } else {
+          db.prepare("INSERT INTO users (username, password_hash, role, created_at) VALUES (?,?,?,?)").run(u.username, u.password_hash, role, u.created_at || nowIso());
+          c.inserted++;
+        }
+      }
+      // 考卷紀錄：按 exam_id upsert
+      for (const e of b.exam_records || []) {
+        const c = count("exam_records");
+        if (!e || typeof e !== "object" || e.exam_id == null || e.user_id == null || !e.title) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM exam_records WHERE exam_id = ?").get(e.exam_id);
+        db.prepare("INSERT INTO exam_records (exam_id,user_id,title,question_list,score,total_questions,start_time,end_time,duration_sec,status) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(exam_id) DO UPDATE SET user_id=excluded.user_id, title=excluded.title, question_list=excluded.question_list, score=excluded.score, total_questions=excluded.total_questions, start_time=excluded.start_time, end_time=excluded.end_time, duration_sec=excluded.duration_sec, status=excluded.status")
+          .run(e.exam_id, e.user_id, e.title, typeof e.question_list === "string" ? e.question_list : JSON.stringify(e.question_list || []), e.score == null ? null : e.score, e.total_questions || 0, e.start_time || nowIso(), e.end_time || null, e.duration_sec == null ? null : e.duration_sec, e.status || "已完成");
+        if (exists) c.updated++; else c.inserted++;
+      }
+      // 答題紀錄：按 record_id upsert
+      for (const a of b.answer_records || []) {
+        const c = count("answer_records");
+        if (!a || typeof a !== "object" || a.record_id == null || a.user_id == null || !a.question_id) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM answer_records WHERE record_id = ?").get(a.record_id);
+        db.prepare("INSERT INTO answer_records (record_id,exam_id,user_id,question_id,user_answer,is_correct,answer_time) VALUES (?,?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET exam_id=excluded.exam_id, user_id=excluded.user_id, question_id=excluded.question_id, user_answer=excluded.user_answer, is_correct=excluded.is_correct, answer_time=excluded.answer_time")
+          .run(a.record_id, a.exam_id == null ? null : a.exam_id, a.user_id, a.question_id, a.user_answer == null ? "" : a.user_answer, a.is_correct ? 1 : 0, a.answer_time || nowIso());
+        if (exists) c.updated++; else c.inserted++;
+      }
+      // 留言：按 comment_id upsert
+      for (const cm of b.comments || []) {
+        const c = count("comments");
+        if (!cm || typeof cm !== "object" || cm.comment_id == null || cm.user_id == null || cm.content == null) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM comments WHERE comment_id = ?").get(cm.comment_id);
+        db.prepare("INSERT INTO comments (comment_id,user_id,question_id,content,created_at,is_deleted) VALUES (?,?,?,?,?,?) ON CONFLICT(comment_id) DO UPDATE SET user_id=excluded.user_id, question_id=excluded.question_id, content=excluded.content, created_at=excluded.created_at, is_deleted=excluded.is_deleted")
+          .run(cm.comment_id, cm.user_id, cm.question_id == null ? null : cm.question_id, cm.content, cm.created_at || nowIso(), cm.is_deleted ? 1 : 0);
+        if (exists) c.updated++; else c.inserted++;
+      }
+      // 收藏：按 favorite_id upsert（同一人同一題只可以收藏一次，衝突就跳過）
+      for (const f of b.favorites || []) {
+        const c = count("favorites");
+        if (!f || typeof f !== "object" || f.user_id == null || !f.question_id) { c.skipped++; continue; }
+        if (f.favorite_id != null) {
+          const exists = db.prepare("SELECT 1 FROM favorites WHERE favorite_id = ?").get(f.favorite_id);
+          if (exists) {
+            db.prepare("UPDATE favorites SET user_id = ?, question_id = ?, created_at = ? WHERE favorite_id = ?").run(f.user_id, f.question_id, f.created_at || nowIso(), f.favorite_id);
+            c.updated++;
+          } else {
+            const r = db.prepare("INSERT OR IGNORE INTO favorites (favorite_id,user_id,question_id,created_at) VALUES (?,?,?,?)").run(f.favorite_id, f.user_id, f.question_id, f.created_at || nowIso());
+            if (r.changes) c.inserted++; else c.skipped++;
+          }
+        } else {
+          const r = db.prepare("INSERT OR IGNORE INTO favorites (user_id,question_id,created_at) VALUES (?,?,?)").run(f.user_id, f.question_id, f.created_at || nowIso());
+          if (r.changes) c.inserted++; else c.skipped++;
+        }
+      }
+      // 登入狀態：按 session_id upsert；已經過期（30 日）嘅就跳過唔還原
+      for (const s of b.sessions || []) {
+        const c = count("sessions");
+        if (!s || typeof s !== "object" || !s.session_id || s.user_id == null) { c.skipped++; continue; }
+        const created = new Date(s.created_at || "").getTime();
+        if (!isNaN(created) && Date.now() - created > SESSION_MAX_AGE_MS) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM sessions WHERE session_id = ?").get(s.session_id);
+        db.prepare("INSERT INTO sessions (session_id,user_id,created_at) VALUES (?,?,?) ON CONFLICT(session_id) DO UPDATE SET user_id=excluded.user_id, created_at=excluded.created_at").run(s.session_id, s.user_id, s.created_at || nowIso());
+        if (exists) c.updated++; else c.inserted++;
+      }
+      // 模擬考草稿：按 exam_id upsert
+      for (const p of b.exam_progress || []) {
+        const c = count("exam_progress");
+        if (!p || typeof p !== "object" || p.exam_id == null) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM exam_progress WHERE exam_id = ?").get(p.exam_id);
+        db.prepare("INSERT INTO exam_progress (exam_id,answers,marked,updated_at) VALUES (?,?,?,?) ON CONFLICT(exam_id) DO UPDATE SET answers=excluded.answers, marked=excluded.marked, updated_at=excluded.updated_at")
+          .run(p.exam_id, typeof p.answers === "string" ? p.answers : JSON.stringify(p.answers || {}), typeof p.marked === "string" ? p.marked : JSON.stringify(p.marked || []), p.updated_at || nowIso());
+        if (exists) c.updated++; else c.inserted++;
+      }
+    });
+  } catch (e) {
+    return res.status(400).json({ error: "還原失敗，已經全部取消，現有資料冇郁過：" + e.message });
+  }
+  res.json({ ok: true, result });
 });
 
 // ---------- 兜底 ----------
