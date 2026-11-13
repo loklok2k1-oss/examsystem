@@ -513,7 +513,7 @@ app.post("/api/questions/batch-update", requireAuth, requireAdmin, (req, res) =>
   if (ids.length > 500) return res.status(400).json({ error: "一次最多修改 500 題。" });
   const exam = req.body.exam != null && String(req.body.exam) !== "" ? String(req.body.exam).trim() : null;
   const difficulty = req.body.difficulty != null && String(req.body.difficulty) !== "" ? String(req.body.difficulty).trim() : null;
-  if (exam != null && exam !== "VTS" && exam !== "430") return res.status(400).json({ error: "考試只可以係 VTS 或者 430。" });
+  if (exam != null && exam.length > 50) return res.status(400).json({ error: "考試名稱唔可以超過 50 個字。" });
   if (difficulty != null && !["簡單", "中等", "困難"].includes(difficulty)) return res.status(400).json({ error: "難度只可以係簡單、中等、困難。" });
   if (exam == null && difficulty == null) return res.status(400).json({ error: "請揀要改嘅分類或者難度。" });
   const sets = [];
@@ -673,28 +673,70 @@ function examQuestionsFor(record) {
   for (const r of rows) byId[r.question_id] = r;
   return ids.map((id) => byId[id]).filter(Boolean).map((r) => hideAnswer(rowToQuestion(r)));
 }
+// ---------- 模擬考組卷篩選（POST /api/exams 同 GET /api/exams/pool 共用） ----------
+const EXAM_SOURCES = ["all", "unanswered", "answered", "wrong"];
+function parseList(v) {
+  if (Array.isArray(v)) return Array.from(new Set(v.map((x) => String(x).trim()).filter(Boolean)));
+  if (typeof v === "string") return Array.from(new Set(v.split(",").map((s) => s.trim()).filter(Boolean)));
+  return [];
+}
+function parseExamFilters(b) {
+  const exams = parseList(b.exams);
+  if (exams.length === 0 && typeof b.exam === "string" && b.exam.trim()) exams.push(b.exam.trim());
+  const difficulties = parseList(b.difficulties);
+  if (difficulties.length === 0 && typeof b.difficulty === "string" && b.difficulty.trim()) difficulties.push(b.difficulty.trim());
+  const source = EXAM_SOURCES.includes(String(b.source || "")) ? String(b.source) : "all";
+  return { exams, difficulties, source };
+}
+function poolQuery(userId, f) {
+  let sql = "SELECT * FROM questions WHERE type != '簡答'";
+  const params = [];
+  if (f.exams.length > 0) { sql += " AND exam IN (" + f.exams.map(() => "?").join(",") + ")"; params.push(...f.exams); }
+  if (f.difficulties.length > 0) { sql += " AND difficulty IN (" + f.difficulties.map(() => "?").join(",") + ")"; params.push(...f.difficulties); }
+  if (f.source === "wrong") sql += " AND EXISTS (SELECT 1 FROM answer_records a WHERE a.question_id = questions.question_id AND a.user_id = ? AND a.is_correct = 0)";
+  else if (f.source === "answered") sql += " AND EXISTS (SELECT 1 FROM answer_records a WHERE a.question_id = questions.question_id AND a.user_id = ?)";
+  else if (f.source === "unanswered") sql += " AND NOT EXISTS (SELECT 1 FROM answer_records a WHERE a.question_id = questions.question_id AND a.user_id = ?)";
+  if (f.source !== "all") params.push(userId);
+  return { sql, params };
+}
+function poolEmptyMessage(f) {
+  if (f.source === "wrong") return "錯題池暫時係空，請先做多啲題。";
+  if (f.source === "unanswered") return "未做過嘅題暫時係空，呢個範圍嘅題你已經做晒。";
+  if (f.source === "answered") return "做過嘅題暫時係空，請先做多啲題。";
+  return "呢個考試暫時冇可組卷嘅題目，請先新增題目或者匯入題庫。";
+}
 app.post("/api/exams", requireAuth, (req, res) => {
   const b = req.body || {};
-  const title = String(b.title || "").trim() || ((b.exam || "模擬考") + " 模擬卷");
+  const f = parseExamFilters(b);
+  const defaultTitle = (f.exams.length > 0 ? f.exams.join("、") : "綜合") + " 模擬卷";
+  const title = String(b.title || "").trim() || defaultTitle;
   const count = Math.max(1, Math.min(100, Number(b.count) || 10));
   let ids = [];
+  let note = null;
   if (Array.isArray(b.question_ids) && b.question_ids.length > 0) {
     ids = b.question_ids.map(String);
   } else {
-    let sql = "SELECT * FROM questions WHERE type != '簡答'";
-    const params = [];
-    if (b.exam) { sql += " AND exam = ?"; params.push(b.exam); }
+    const { sql, params } = poolQuery(req.user.user_id, f);
     const pool = db.prepare(sql).all(...params);
-    if (pool.length === 0) return res.status(400).json({ error: "呢個考試暫時冇可組卷嘅題目，請先新增題目或者匯入題庫。" });
+    if (pool.length === 0) return res.status(400).json({ error: poolEmptyMessage(f) });
     for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = pool[i]; pool[i] = pool[j]; pool[j] = t; }
+    if (pool.length < count) note = "符合條件得 " + pool.length + " 題，已用晒";
     ids = pool.slice(0, count).map((r) => r.question_id);
   }
   const info = db.prepare("INSERT INTO exam_records (user_id, title, question_list, score, total_questions, start_time, status) VALUES (?,?,?,?,?,?,?)").run(req.user.user_id, title, JSON.stringify(ids), null, ids.length, nowIso(), "進行中");
-  res.json({ exam_id: info.lastInsertRowid, title, question_ids: ids, total_questions: ids.length });
+  res.json(Object.assign({ exam_id: info.lastInsertRowid, title, question_ids: ids, total_questions: ids.length }, note ? { note } : {}));
 });
 app.get("/api/exams", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT * FROM exam_records WHERE user_id = ? ORDER BY exam_id DESC").all(req.user.user_id);
   res.json({ exams: rows.map((r) => ({ exam_id: r.exam_id, title: r.title, question_list: safeJson(r.question_list, []), score: r.score, total_questions: r.total_questions, start_time: r.start_time, end_time: r.end_time, duration_sec: r.duration_sec, status: r.status })) });
+});
+// 題池數查詢：淨係回傳題數，唔回傳題目內容同答案，唔可以經呢個接口拎到答案。
+// 注意：一定要放喺 /api/exams/:id 前面，否則 "pool" 會被當成考卷編號。
+app.get("/api/exams/pool", requireAuth, (req, res) => {
+  const f = parseExamFilters(req.query || {});
+  const { sql, params } = poolQuery(req.user.user_id, f);
+  const pool = db.prepare(sql).all(...params);
+  res.json({ count: pool.length });
 });
 app.get("/api/exams/:id", requireAuth, (req, res) => {
   const rec = db.prepare("SELECT * FROM exam_records WHERE exam_id = ? AND user_id = ?").get(req.params.id, req.user.user_id);
@@ -810,6 +852,66 @@ app.get("/api/stats/admin", requireAuth, requireAdmin, (req, res) => {
   const byDiff = db.prepare("SELECT difficulty, COUNT(*) AS n FROM questions GROUP BY difficulty ORDER BY difficulty").all();
   const byExam = db.prepare("SELECT exam, COUNT(*) AS n FROM questions GROUP BY exam ORDER BY exam").all();
   res.json({ questions: qTotal, users: uTotal, comments: cTotal, byType, byDifficulty: byDiff, byExam });
+});
+
+// ---------- 學生表現分析（管理員） ----------
+// 全部用 SQL 聚合現有表，唔加表、唔改欄位。
+// 註：answer_records.is_correct 欄位係 INTEGER NOT NULL DEFAULT 0，唔會有 NULL；
+// 簡答題喺刷題係學生自評（self_correct ? 1 : 0），模擬考組卷本身唔包簡答。
+// 為穩陣起見，聚合時仍加 is_correct IS NOT NULL 條件。
+// 可選 ?user_id=N：只回傳該學生詳情（各考試正確率、最近 5 份模擬考、錯得最多 5 題）。
+app.get("/api/admin/analytics", requireAuth, requireAdmin, (req, res) => {
+  const uid = req.query.user_id ? Number(req.query.user_id) : null;
+  if (uid != null && !Number.isNaN(uid)) {
+    const u = db.prepare("SELECT user_id, username, role, created_at FROM users WHERE user_id = ?").get(uid);
+    if (!u) return res.status(404).json({ error: "搵唔到呢個帳號。" });
+    const perExam = db.prepare("SELECT q.exam AS exam, COUNT(*) AS total, COALESCE(SUM(a.is_correct),0) AS correct FROM answer_records a JOIN questions q ON q.question_id = a.question_id WHERE a.user_id = ? AND a.is_correct IS NOT NULL GROUP BY q.exam ORDER BY q.exam").all(uid)
+      .map((x) => ({ exam: x.exam, total: x.total, correct: x.correct, accuracy: x.total ? Math.round((x.correct / x.total) * 100) : null }));
+    const recent = db.prepare("SELECT exam_id, title, score, total_questions, end_time FROM exam_records WHERE user_id = ? AND status = '已完成' ORDER BY end_time DESC LIMIT 5").all(uid);
+    const topMissed = db.prepare("SELECT q.question_id AS question_id, q.content AS content, q.exam AS exam, q.type AS type, COUNT(*) AS total, SUM(CASE WHEN a.is_correct = 0 THEN 1 ELSE 0 END) AS wrong FROM answer_records a JOIN questions q ON q.question_id = a.question_id WHERE a.user_id = ? AND a.is_correct IS NOT NULL GROUP BY q.question_id HAVING SUM(CASE WHEN a.is_correct = 0 THEN 1 ELSE 0 END) > 0 ORDER BY wrong DESC, total DESC LIMIT 5").all(uid)
+      .map((x) => ({ question_id: x.question_id, content: x.content, exam: x.exam, type: x.type, total: x.total, wrong: x.wrong }));
+    return res.json({ studentDetail: { user_id: u.user_id, username: u.username, role: u.role, created_at: u.created_at, perExam, recentExams: recent, topMissed } });
+  }
+
+  const users = db.prepare("SELECT user_id, username, role, created_at FROM users ORDER BY user_id").all();
+  const ansByUser = new Map(db.prepare("SELECT user_id, COUNT(*) AS n, COALESCE(SUM(is_correct),0) AS c FROM answer_records WHERE is_correct IS NOT NULL GROUP BY user_id").all().map((r) => [r.user_id, r]));
+  const exByUser = new Map(db.prepare("SELECT user_id, COUNT(*) AS done, AVG(score * 1.0 / total_questions) * 100 AS avgPct FROM exam_records WHERE status = '已完成' AND total_questions > 0 GROUP BY user_id").all().map((r) => [r.user_id, r]));
+  const lastByUser = new Map(db.prepare("SELECT user_id, MAX(answer_time) AS t FROM answer_records GROUP BY user_id").all().map((r) => [r.user_id, r.t]));
+  const perUserExam = db.prepare("SELECT a.user_id AS user_id, q.exam AS exam, COUNT(*) AS total, COALESCE(SUM(a.is_correct),0) AS correct FROM answer_records a JOIN questions q ON q.question_id = a.question_id WHERE a.is_correct IS NOT NULL GROUP BY a.user_id, q.exam").all();
+  const weakestByUser = new Map();
+  for (const r of perUserExam) {
+    if (r.total < 3) continue;
+    const acc = Math.round((r.correct / r.total) * 100);
+    const cur = weakestByUser.get(r.user_id);
+    if (!cur || acc < cur.accuracy || (acc === cur.accuracy && r.total > cur.total)) weakestByUser.set(r.user_id, { exam: r.exam, accuracy: acc, total: r.total });
+  }
+  const perStudent = users.map((u) => {
+    const a = ansByUser.get(u.user_id) || { n: 0, c: 0 };
+    const e = exByUser.get(u.user_id) || { done: 0, avgPct: null };
+    return {
+      user_id: u.user_id, username: u.username, role: u.role, created_at: u.created_at,
+      answers: a.n, correct: a.c, accuracy: a.n ? Math.round((a.c / a.n) * 100) : null,
+      examsDone: e.done, avgScore: e.avgPct == null ? null : Math.round(e.avgPct),
+      lastActive: lastByUser.get(u.user_id) || u.created_at,
+      weakestExam: weakestByUser.get(u.user_id) || null,
+    };
+  });
+
+  function groupAccuracy(groupCol) {
+    return db.prepare("SELECT q." + groupCol + " AS k, COUNT(*) AS total, COALESCE(SUM(a.is_correct),0) AS correct FROM answer_records a JOIN questions q ON q.question_id = a.question_id WHERE a.is_correct IS NOT NULL GROUP BY q." + groupCol + " ORDER BY k").all()
+      .map((x) => ({ label: x.k, total: x.total, correct: x.correct, accuracy: x.total ? Math.round((x.correct / x.total) * 100) : null }))
+      .sort((x, y) => (x.accuracy == null ? 101 : x.accuracy) - (y.accuracy == null ? 101 : y.accuracy));
+  }
+  const weakByExam = groupAccuracy("exam");
+  const weakByType = groupAccuracy("type");
+  const weakByDifficulty = groupAccuracy("difficulty");
+
+  const mostMissed = db.prepare("SELECT q.question_id AS question_id, q.content AS content, q.exam AS exam, q.type AS type, q.difficulty AS difficulty, COUNT(*) AS total, SUM(CASE WHEN a.is_correct = 0 THEN 1 ELSE 0 END) AS wrong FROM answer_records a JOIN questions q ON q.question_id = a.question_id WHERE a.is_correct IS NOT NULL GROUP BY q.question_id HAVING SUM(CASE WHEN a.is_correct = 0 THEN 1 ELSE 0 END) > 0 ORDER BY wrong * 1.0 / total DESC, wrong DESC LIMIT 20").all()
+    .map((x) => ({ question_id: x.question_id, content: x.content, exam: x.exam, type: x.type, difficulty: x.difficulty, total: x.total, wrong: x.wrong, missRate: x.total ? Math.round((x.wrong / x.total) * 100) : 0 }));
+
+  const recentExams = db.prepare("SELECT e.exam_id AS exam_id, e.title AS title, e.score AS score, e.total_questions AS total_questions, e.end_time AS end_time, u.username AS username FROM exam_records e JOIN users u ON u.user_id = e.user_id WHERE e.status = '已完成' ORDER BY e.end_time DESC LIMIT 10").all();
+
+  res.json({ perStudent, weakByExam, weakByType, weakByDifficulty, mostMissed, recentExams });
 });
 
 // ---------- 匯出備份同還原（管理員） ----------
