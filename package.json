@@ -1,0 +1,1 @@
+{"dependencies":{"express":"^4.21.2"},"description":"考試系統 — 獨立版（Node.js + Express + SQLite，VTS 同 430 備考用）","engines":{"node":">=22"},"license":"MIT","main":"server.js","name":"exam-system-standalone","scripts":{"start":"node server.js"},"version":"1.0.0"}
