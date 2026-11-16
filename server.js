@@ -8,6 +8,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const express = require("express");
+const multer = require("multer");
 
 let DatabaseSync;
 try {
@@ -22,8 +23,10 @@ const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "exam.db");
+const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const db = new DatabaseSync(DB_PATH);
 db.exec("PRAGMA foreign_keys = ON");
@@ -45,6 +48,7 @@ db.exec(`
     explanation TEXT NOT NULL DEFAULT '',
     exam TEXT NOT NULL DEFAULT '',
     difficulty TEXT NOT NULL DEFAULT '中等',
+    media TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS exam_records (
@@ -94,7 +98,25 @@ db.exec(`
     marked TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS paper_templates (
+    template_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    config TEXT NOT NULL DEFAULT '[]',
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
 `);
+
+// ---------- 遷移：舊資料庫嘅 questions 表加 media 欄位 ----------
+// 新資料庫 CREATE TABLE 已經有 media；舊資料庫升級之後第一次啟動會喺度補加。
+// 用 PRAGMA 檢查欄位係咪存在，唔存在先至 ALTER TABLE，唔會影響舊資料。
+(function migrateMediaColumn() {
+  const cols = db.prepare("PRAGMA table_info(questions)").all();
+  if (!cols.some((c) => c.name === "media")) {
+    db.exec("ALTER TABLE questions ADD COLUMN media TEXT NOT NULL DEFAULT '[]'");
+    console.log("資料庫遷移：questions 表已加 media 欄位（題目圖片／影片）。");
+  }
+})();
 
 // ---------- 種子資料：第一次啟動、題庫為空時寫入 Test-001 ----------
 function seedIfEmpty() {
@@ -131,7 +153,40 @@ function newToken() { return crypto.randomBytes(32).toString("hex"); }
 function publicUser(u) { return u ? { user_id: u.user_id, username: u.username, role: u.role, created_at: u.created_at } : null; }
 function rowToQuestion(r) {
   if (!r) return null;
-  return { question_id: r.question_id, type: r.type, content: r.content, options: safeJson(r.options, []), answer: r.answer, explanation: r.explanation, exam: r.exam, difficulty: r.difficulty, created_at: r.created_at };
+  return { question_id: r.question_id, type: r.type, content: r.content, options: safeJson(r.options, []), answer: r.answer, explanation: r.explanation, exam: r.exam, difficulty: r.difficulty, media: parseMedia(r.media), created_at: r.created_at };
+}
+// media 欄位存 JSON 陣列，每項係 {type:"image"|"video", url, place, option?}：
+// place 係 stem（題幹）/ explanation（解析）/ option（某個選項），
+// place 係 option 嗰陣 option 係該選項嘅字母（例如 "B"）；冇寫明位置嘅當題幹處理。
+// 舊資料或者格式唔啱，一律當做冇媒體，唔會令成題壞掉。
+function parseMedia(v) {
+  const a = safeJson(v, []);
+  if (!Array.isArray(a)) return [];
+  const out = [];
+  for (const x of a) {
+    const r = normalizeMediaItem(x);
+    if (r.ok) out.push(r.item);
+  }
+  return out;
+}
+// 逐項驗證一格媒體：連結只接受 /uploads/ 或者 http(s)；type 唔寫就按副檔名估；
+// place 唔寫或者唔啱就當題幹；place 係 option 一定要指明邊個選項。
+function normalizeMediaItem(it) {
+  if (!it || typeof it !== "object") return { ok: false, error: "媒體格式唔啱。" };
+  const url = String(it.url || "").trim();
+  if (!url) return { ok: false, error: "媒體連結唔可以留空。" };
+  if (!isSafeMediaUrl(url)) return { ok: false, error: "媒體連結唔啱：淨係接受 /uploads/ 檔案或者 http(s) 連結（" + url + "）。" };
+  let place = String(it.place || "stem").trim().toLowerCase();
+  if (!["stem", "explanation", "option"].includes(place)) place = "stem";
+  let option = null;
+  if (place === "option") {
+    option = String(it.option || "").trim().toUpperCase();
+    if (!/^[A-Z]$/.test(option)) return { ok: false, error: "選項圖片要指明係邊個選項（例如 B）。" };
+  }
+  const type = it.type === "video" || it.type === "image" ? it.type : (VIDEO_EXTS.has(mediaExtOf(url)) ? "video" : "image");
+  const item = { type, url, place };
+  if (place === "option") item.option = option;
+  return { ok: true, item };
 }
 function hideAnswer(q) {
   if (!q) return null;
@@ -262,17 +317,107 @@ function parseOptionsCell(cell) {
   if (t.startsWith("[")) { try { const a = JSON.parse(t); return Array.isArray(a) ? a.map(String) : []; } catch (e) { return []; } }
   return t.split("|").map((x) => x.trim()).filter(Boolean);
 }
-const CSV_HEADERS = ["question_id", "type", "content", "options", "answer", "explanation", "exam", "difficulty"];
+// CSV 匯出用：media 欄寫返位置前綴，匯入嗰陣可以原樣還原。
+// 題幹唔寫前綴，選項寫 optB:連結，解析寫 explanation:連結。
+function mediaCellForCsv(media) {
+  return parseMedia(media).map((mItem) => {
+    if (mItem.place === "option") return "opt" + (mItem.option || "") + ":" + mItem.url;
+    if (mItem.place === "explanation") return "explanation:" + mItem.url;
+    return mItem.url;
+  }).join(";");
+}
+const CSV_HEADERS = ["question_id", "type", "content", "options", "answer", "explanation", "exam", "difficulty", "media"];
 function csvTemplate() {
   const rows = [
-    ["DEMO-001", "單選", "避碰規則：兩船對遇時，邊一邊應該讓路？", "左舷讓路|右舷讓路|直航船讓路|兩船同時轉向", "A", "對遇局面，兩船都應該向右轉，互相從左舷通過。", "VTS", "簡單"],
-    ["DEMO-002", "多選", "以下邊啲屬於 VTS 服務範圍？", "船舶交通組織|助航服務|危險品監控|天氣預報", "ABC", "VTS 提供交通組織、助航同危險品監控，天氣預報唔係 VTS 本身服務。", "VTS", "中等"],
-    ["DEMO-003", "判斷", "追越船必須讓路給被追越船。", "正確|錯誤", "正確", "追越船係讓路船，必須避讓被追越船。", "VTS", "簡單"],
-    ["DEMO-004", "簡答", "請簡述 VHF 第 16 頻道嘅用途。", "", "第 16 頻道係國際遇險、緊急同呼叫頻道，用於遇險求救同建立聯絡，聯絡好之後要轉去工作頻道通話，唔好長期佔用。", "第 16 頻道係國際遇險、緊急同呼叫頻道，用於遇險求救同建立聯絡，聯絡好之後要轉去工作頻道通話，唔好長期佔用。", "VTS", "中等"],
+    ["DEMO-001", "單選", "避碰規則：兩船對遇時，邊一邊應該讓路？", "左舷讓路|右舷讓路|直航船讓路|兩船同時轉向", "A", "對遇局面，兩船都應該向右轉，互相從左舷通過。", "VTS", "簡單", "stem:https://example.com/eg-ship.jpg"],
+    ["DEMO-002", "多選", "以下邊啲屬於 VTS 服務範圍？", "船舶交通組織|助航服務|危險品監控|天氣預報", "ABC", "VTS 提供交通組織、助航同危險品監控，天氣預報唔係 VTS 本身服務。", "VTS", "中等", ""],
+    ["DEMO-003", "判斷", "追越船必須讓路給被追越船。", "正確|錯誤", "正確", "追越船係讓路船，必須避讓被追越船。", "VTS", "簡單", "optA:https://example.com/eg-yes.jpg"],
+    ["DEMO-004", "簡答", "請簡述 VHF 第 16 頻道嘅用途。", "", "第 16 頻道係國際遇險、緊急同呼叫頻道，用於遇險求救同建立聯絡，聯絡好之後要轉去工作頻道通話，唔好長期佔用。", "第 16 頻道係國際遇險、緊急同呼叫頻道，用於遇險求救同建立聯絡，聯絡好之後要轉去工作頻道通話，唔好長期佔用。", "VTS", "中等", "explanation:https://example.com/eg-ch16.mp4"],
   ];
   const lines = [CSV_HEADERS.join(",")];
   for (const r of rows) lines.push(r.map(csvEscape).join(","));
   return lines.join("\n");
+}
+
+// ---------- 題目媒體（圖片／影片） ----------
+// 每條題目最多 5 個媒體。連結只接受兩種：/uploads/ 開頭（本站上傳嘅檔案）
+// 或者 http(s) 連結（外部圖片／影片）。其他寫法（javascript:、data:、相對路徑、
+// 含 ..）一律拒絕，避免 XSS 同路徑穿越。
+const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
+const VIDEO_EXTS = new Set([".mp4", ".webm", ".mov"]);
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+const VIDEO_MAX_BYTES = 20 * 1024 * 1024;
+const MEDIA_MAX_PER_QUESTION = 5;
+function mediaExtOf(url) {
+  const clean = String(url || "").split("?")[0].split("#")[0].toLowerCase();
+  const i = clean.lastIndexOf(".");
+  return i >= 0 ? clean.slice(i) : "";
+}
+function isSafeMediaUrl(url) {
+  const u = String(url || "").trim();
+  if (!u || /\s/.test(u)) return false;
+  if (u.startsWith("/uploads/")) return !u.includes("..");
+  return /^https?:\/\/[^/]+/i.test(u);
+}
+// 嚴格版：傳一個唔啱就成題失敗（新增／修改題目用）。
+function normalizeMedia(input) {
+  if (input == null || input === "") return { ok: true, media: [] };
+  let arr;
+  if (typeof input === "string") {
+    const t = input.trim();
+    if (!t) return { ok: true, media: [] };
+    if (t.startsWith("[")) {
+      try { const a = JSON.parse(t); if (!Array.isArray(a)) return { ok: false, error: "媒體格式唔啱。" }; arr = a; }
+      catch (e) { return { ok: false, error: "媒體格式唔啱。" }; }
+    } else arr = t.split(";").map((s) => s.trim()).filter(Boolean).map((u) => ({ url: u }));
+  } else if (Array.isArray(input)) arr = input;
+  else return { ok: false, error: "媒體格式唔啱。" };
+  if (arr.length > MEDIA_MAX_PER_QUESTION) return { ok: false, error: "每條題目最多 " + MEDIA_MAX_PER_QUESTION + " 個媒體。" };
+  const out = [];
+  const seen = new Set();
+  for (const it of arr) {
+    const r = normalizeMediaItem(it);
+    if (!r.ok) return r;
+    const key = r.item.place + "|" + (r.item.option || "") + "|" + r.item.url;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r.item);
+  }
+  return { ok: true, media: out };
+}
+// 寬鬆版：逐條連結驗證，唔啱就跳過並記低（CSV 匯入用，唔好因為一條連結錯成行題目都唔入）。
+// 支援位置前綴：stem:連結（題幹，唔寫前綴都當題幹）、optB:連結（選項 B）、explanation:連結（解析），用 ; 分隔。
+function parseMediaListLenient(cell) {
+  const media = [];
+  const skipped = [];
+  const parts = String(cell == null ? "" : cell).split(";").map((s) => s.trim()).filter(Boolean);
+  for (const seg of parts) {
+    if (media.length >= MEDIA_MAX_PER_QUESTION) { skipped.push(seg + "（超過每題 5 個上限）"); continue; }
+    let place = "stem", option = null, url = seg;
+    const m = seg.match(/^(stem|explanation|opt([A-Za-z]))\s*:\s*(.+)$/i);
+    if (m) {
+      const head = m[1].toLowerCase();
+      if (head === "explanation") place = "explanation";
+      else if (head.startsWith("opt")) { place = "option"; option = m[2].toUpperCase(); }
+      url = m[3].trim();
+    }
+    const r = normalizeMediaItem({ url, place, option });
+    if (!r.ok) { skipped.push(seg + "（" + r.error + "）"); continue; }
+    const key = r.item.place + "|" + (r.item.option || "") + "|" + r.item.url;
+    if (media.some((mm) => mm.place + "|" + (mm.option || "") + "|" + mm.url === key)) continue;
+    media.push(r.item);
+  }
+  return { media, skipped };
+}
+// 備份還原用：將任何形式嘅 media 寫法正規化做可以存入資料庫嘅 JSON 字串。
+function mediaJson(v) {
+  if (typeof v === "string") {
+    try { const a = JSON.parse(v); if (Array.isArray(a)) return JSON.stringify(parseMedia(v)); } catch (e) {}
+    const r = normalizeMedia(v);
+    return r.ok ? JSON.stringify(r.media) : "[]";
+  }
+  if (Array.isArray(v)) return JSON.stringify(parseMedia(JSON.stringify(v)));
+  return "[]";
 }
 
 // ---------- 驗證一題（新增、修改、匯入共用） ----------
@@ -300,16 +445,18 @@ function validateQuestionInput(b, isNew) {
   if (missing.length > 0) return { ok: false, error: "請填寫： " + missing.join("、") + "。" };
   if (!["單選", "多選", "判斷", "簡答"].includes(type)) return { ok: false, error: "題型只可以係單選、多選、判斷、簡答。" };
   if (!["簡單", "中等", "困難"].includes(difficulty)) return { ok: false, error: "難度只可以係簡單、中等、困難。" };
+  const mediaRes = normalizeMedia(b.media);
+  if (!mediaRes.ok) return { ok: false, error: mediaRes.error };
   if (type !== "簡答") {
     const v = validateAnswer(type, options, answer);
     if (!v.ok) return { ok: false, error: v.error };
-    return { ok: true, q: { question_id: qid, type, content, options, answer: v.normalized, explanation, exam, difficulty } };
+    return { ok: true, q: { question_id: qid, type, content, options, answer: v.normalized, explanation, exam, difficulty, media: mediaRes.media } };
   }
-  return { ok: true, q: { question_id: qid, type, content, options, answer, explanation, exam, difficulty } };
+  return { ok: true, q: { question_id: qid, type, content, options, answer, explanation, exam, difficulty, media: mediaRes.media } };
 }
 function saveQuestion(q) {
   const now = nowIso();
-  db.prepare("INSERT INTO questions (question_id,type,content,options,answer,explanation,exam,difficulty,created_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(question_id) DO UPDATE SET type=excluded.type, content=excluded.content, options=excluded.options, answer=excluded.answer, explanation=excluded.explanation, exam=excluded.exam, difficulty=excluded.difficulty").run(q.question_id, q.type, q.content, JSON.stringify(q.options), q.answer, q.explanation, q.exam, q.difficulty, now);
+  db.prepare("INSERT INTO questions (question_id,type,content,options,answer,explanation,exam,difficulty,media,created_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(question_id) DO UPDATE SET type=excluded.type, content=excluded.content, options=excluded.options, answer=excluded.answer, explanation=excluded.explanation, exam=excluded.exam, difficulty=excluded.difficulty, media=excluded.media").run(q.question_id, q.type, q.content, JSON.stringify(q.options), q.answer, q.explanation, q.exam, q.difficulty, JSON.stringify(q.media || []), now);
 }
 
 // ---------- Express ----------
@@ -325,6 +472,9 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "20mb" })); // 還原備份 JSON 可能比較大
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(ROOT, "public")));
+// 題目上傳嘅圖片／影片：檔案實體存喺 data/uploads/（更新成個資料夾覆蓋嗰陣唔會刪走），
+// 用 /uploads 掛出嚟。副檔名已經喺上傳嗰陣驗證過（唔接受 svg / html 等），加埋 nosniff header。
+app.use("/uploads", express.static(UPLOAD_DIR));
 
 // ---------- 認證 ----------
 function getSessionUser(req) {
@@ -430,6 +580,43 @@ app.post("/api/admin/users/:id/role", requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- 媒體上傳（管理員） ----------
+// 上傳即存檔，唔使事先開題目；回傳嘅 url 填入題目表格嘅媒體清單就得。
+// 檔案名用隨機名加原本副檔名，唔用用戶傳上嚟嘅檔名（防路徑穿越）；
+// 圖片唔多過 5 MB、影片唔多過 20 MB；每條題目最多 5 個媒體（喺儲存題目嗰陣驗證）。
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || "").toLowerCase();
+      cb(null, crypto.randomBytes(16).toString("hex") + ext);
+    },
+  }),
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (IMAGE_EXTS.has(ext) || VIDEO_EXTS.has(ext)) return cb(null, true);
+    cb(new Error("唔接受呢種檔案格式：圖片只接受 jpg / jpeg / png / gif / webp，影片只接受 mp4 / webm / mov（唔接受 svg、html 等）。"));
+  },
+  limits: { fileSize: VIDEO_MAX_BYTES },
+});
+app.post("/api/upload", requireAuth, requireAdmin, (req, res) => {
+  upload.single("file")(req, res, (err) => {
+    if (err) {
+      if (err.code === "LIMIT_FILE_SIZE") return res.status(400).json({ error: "檔案太大：圖片唔可以超過 5 MB，影片唔可以超過 20 MB。" });
+      return res.status(400).json({ error: err.message || "上傳失敗。" });
+    }
+    if (!req.file) return res.status(400).json({ error: "請揀一個檔案上傳。" });
+    const ext = path.extname(req.file.filename).toLowerCase();
+    const type = VIDEO_EXTS.has(ext) ? "video" : "image";
+    const max = type === "image" ? IMAGE_MAX_BYTES : VIDEO_MAX_BYTES;
+    if (req.file.size > max) {
+      fs.unlink(req.file.path, () => {});
+      return res.status(400).json({ error: "圖片唔可以超過 5 MB（你上傳咗 " + Math.round(req.file.size / 1024 / 1024 * 10) / 10 + " MB）。" });
+    }
+    res.json({ url: "/uploads/" + req.file.filename, type });
+  });
+});
+
 // ---------- 題庫 ----------
 app.get("/api/questions", requireAuth, (req, res) => {
   const { exam, difficulty, type, q } = req.query;
@@ -468,10 +655,12 @@ app.post("/api/questions", requireAuth, requireAdmin, (req, res) => {
 });
 app.put("/api/questions/:id", requireAuth, requireAdmin, (req, res) => {
   const body = Object.assign({}, req.body || {}, { question_id: req.params.id });
+  const exists = db.prepare("SELECT * FROM questions WHERE question_id = ?").get(req.params.id);
+  if (!exists) return res.status(404).json({ error: "搵唔到呢條題目。" });
+  // 修改請求如果冇帶 media 欄位（例如舊版前端），保留原本嘅媒體，唔好無啦啦清走。
+  if (body.media === undefined) body.media = parseMedia(exists.media);
   const v = validateQuestionInput(body, false);
   if (!v.ok) return res.status(400).json({ error: v.error });
-  const exists = db.prepare("SELECT 1 FROM questions WHERE question_id = ?").get(req.params.id);
-  if (!exists) return res.status(404).json({ error: "搵唔到呢條題目。" });
   saveQuestion(v.q);
   res.json({ question: v.q });
 });
@@ -563,12 +752,19 @@ app.post("/api/questions/import", requireAuth, requireAdmin, (req, res) => {
       explanation: get(r, "explanation").trim(),
       exam: examCol != null ? String(r[examCol] == null ? "" : r[examCol]).trim() : "",
       difficulty: (get(r, "difficulty").trim() || "中等"),
+      media: get(r, "media"),
     };
     if (!raw.question_id) { errors.push("第 " + lineNo + " 行：缺少編號 question_id。"); continue; }
     if (seenInFile.has(raw.question_id)) { errors.push("第 " + lineNo + " 行：編號 " + raw.question_id + " 喺檔案內重複咗。"); continue; }
     seenInFile.add(raw.question_id);
+    // media 欄用寬鬆版解析：唔啱格式嘅連結逐條跳過、記低，其餘照入，唔好因為一條連結錯成行題目都唔入。
+    const mediaNote = parseMediaListLenient(raw.media);
+    raw.media = mediaNote.media;
     const v = validateQuestionInput(raw, true);
     if (!v.ok) { errors.push("第 " + lineNo + " 行（" + raw.question_id + "）：" + v.error); continue; }
+    if (mediaNote.skipped.length > 0) {
+      errors.push("第 " + lineNo + " 行（" + raw.question_id + "）：媒體連結唔啱，已跳過：" + mediaNote.skipped.join("、") + "。");
+    }
     const exists = db.prepare("SELECT 1 FROM questions WHERE question_id = ?").get(v.q.question_id);
     if (exists && mode === "skip") { skipped++; continue; }
     if (exists && mode === "overwrite") overwritten++;
@@ -705,26 +901,91 @@ function poolEmptyMessage(f) {
   if (f.source === "answered") return "做過嘅題暫時係空，請先做多啲題。";
   return "呢個考試暫時冇可組卷嘅題目，請先新增題目或者匯入題庫。";
 }
+// 按規則隨機抽題：每條規則係一個考試加題數，唔同規則之間唔重複，排除簡答題；
+// 某條規則題池唔夠數就用晒並記低 note。模板開卷同按考試組卷共用。
+function sampleByRules(userId, rules) {
+  const notes = [];
+  const picked = [];
+  for (const rule of rules) {
+    const rf = { exams: [String(rule.exam || "")], difficulties: Array.isArray(rule.difficulties) ? rule.difficulties : [], source: EXAM_SOURCES.includes(String(rule.source || "")) ? String(rule.source) : "all" };
+    const { sql, params } = poolQuery(userId, rf);
+    const pool = db.prepare(sql).all(...params).filter((r) => !picked.includes(r.question_id));
+    for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp; }
+    const want = Math.max(1, Math.min(100, Number(rule.count) || 0));
+    const take = Math.min(want, pool.length);
+    picked.push(...pool.slice(0, take).map((r) => r.question_id));
+    if (take < want) notes.push(rf.exams[0] + " 得 " + pool.length + " 題，已用晒（想要 " + want + " 題）");
+  }
+  return { picked, notes };
+}
 app.post("/api/exams", requireAuth, (req, res) => {
   const b = req.body || {};
   const f = parseExamFilters(b);
-  const defaultTitle = (f.exams.length > 0 ? f.exams.join("、") : "綜合") + " 模擬卷";
-  const title = String(b.title || "").trim() || defaultTitle;
+  const title = String(b.title || "").trim();
   const count = Math.max(1, Math.min(100, Number(b.count) || 10));
   let ids = [];
   let note = null;
-  if (Array.isArray(b.question_ids) && b.question_ids.length > 0) {
-    ids = b.question_ids.map(String);
+  let defaultTitle = (f.exams.length > 0 ? f.exams.join("、") : "綜合") + " 模擬卷";
+  if (b.template_id != null && String(b.template_id) !== "") {
+    // 模板模式：按模板每條規則隨機抽題，唔同規則之間唔重複，排除簡答題。
+    const tid = Number(b.template_id);
+    if (!Number.isInteger(tid)) return res.status(400).json({ error: "模板編號唔啱。" });
+    const t = db.prepare("SELECT * FROM paper_templates WHERE template_id = ?").get(tid);
+    if (!t) return res.status(404).json({ error: "搵唔到呢個模板。" });
+    const rules = safeJson(t.config, []);
+    if (!Array.isArray(rules) || rules.length === 0) return res.status(400).json({ error: "呢個模板冇有效規則。" });
+    const tplSample = sampleByRules(req.user.user_id, rules);
+    if (tplSample.picked.length === 0) return res.status(400).json({ error: "呢個模板加埋 0 題，請檢查模板規則或者先匯入題目。" });
+    ids = tplSample.picked;
+    if (tplSample.notes.length) note = tplSample.notes.join("；");
+    defaultTitle = t.title + " 模擬卷";
+  } else if (Array.isArray(b.rules)) {
+    // 按考試組卷（即場組合）：每條規則係一個考試加題數，同模板一樣隨機抽題。
+    if (b.rules.length === 0) return res.status(400).json({ error: "請至少剔選一個考試。" });
+    const v = validateTemplateConfig(b.rules);
+    if (!v.ok) return res.status(400).json({ error: v.error });
+    const rs = sampleByRules(req.user.user_id, v.rules);
+    if (rs.picked.length === 0) return res.status(400).json({ error: "呢組規則加埋 0 題，請檢查考試或者先匯入題目。" });
+    ids = rs.picked;
+    if (rs.notes.length) note = rs.notes.join("；");
+    defaultTitle = v.rules.map((r) => r.exam).join("、") + " 模擬卷";
+  } else if (b.question_ids !== undefined) {
+    // 手動模式：已選題目先驗證、去重、踢走簡答題，全部入卷；唔夠目標題數就由同一篩選隨機補齊。
+    if (!Array.isArray(b.question_ids) || b.question_ids.length === 0) return res.status(400).json({ error: "手動組卷請先挑選至少一條題目。" });
+    const wanted = Array.from(new Set(b.question_ids.map((x) => String(x).trim()).filter(Boolean)));
+    if (wanted.length === 0) return res.status(400).json({ error: "手動組卷請先挑選至少一條題目。" });
+    const rows = db.prepare("SELECT * FROM questions WHERE question_id IN (" + wanted.map(() => "?").join(",") + ")").all(...wanted);
+    const byId = new Map(rows.map((r) => [r.question_id, r]));
+    const missing = wanted.filter((id) => !byId.has(id));
+    const shortIds = wanted.filter((id) => byId.has(id) && byId.get(id).type === "簡答");
+    let picked = wanted.filter((id) => byId.has(id) && byId.get(id).type !== "簡答");
+    const notes = [];
+    if (missing.length) notes.push("搵唔到編號：" + missing.join("、") + "，已忽略");
+    if (shortIds.length) notes.push("簡答題唔入模擬考，已踢走：" + shortIds.join("、"));
+    if (picked.length === 0) return res.status(400).json({ error: "已選嘅題目全部無效（編號唔存在或者係簡答題）。" + (notes.length ? "（" + notes.join("；") + "）" : "") });
+    if (count > picked.length) {
+      const { sql, params } = poolQuery(req.user.user_id, f);
+      const pool = db.prepare(sql).all(...params).filter((r) => !picked.includes(r.question_id));
+      for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp; }
+      const fill = pool.slice(0, count - picked.length).map((r) => r.question_id);
+      notes.push("已選 " + picked.length + " 題，隨機補齊 " + fill.length + " 題");
+      picked = picked.concat(fill);
+    } else {
+      notes.push("已選 " + picked.length + " 題，目標題數 " + count + " 題，用晒已選題目");
+    }
+    ids = picked;
+    if (notes.length) note = notes.join("；");
   } else {
     const { sql, params } = poolQuery(req.user.user_id, f);
     const pool = db.prepare(sql).all(...params);
     if (pool.length === 0) return res.status(400).json({ error: poolEmptyMessage(f) });
-    for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = pool[i]; pool[i] = pool[j]; pool[j] = t; }
+    for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp; }
     if (pool.length < count) note = "符合條件得 " + pool.length + " 題，已用晒";
     ids = pool.slice(0, count).map((r) => r.question_id);
   }
-  const info = db.prepare("INSERT INTO exam_records (user_id, title, question_list, score, total_questions, start_time, status) VALUES (?,?,?,?,?,?,?)").run(req.user.user_id, title, JSON.stringify(ids), null, ids.length, nowIso(), "進行中");
-  res.json(Object.assign({ exam_id: info.lastInsertRowid, title, question_ids: ids, total_questions: ids.length }, note ? { note } : {}));
+  const finalTitle = title || defaultTitle;
+  const info = db.prepare("INSERT INTO exam_records (user_id, title, question_list, score, total_questions, start_time, status) VALUES (?,?,?,?,?,?,?)").run(req.user.user_id, finalTitle, JSON.stringify(ids), null, ids.length, nowIso(), "進行中");
+  res.json(Object.assign({ exam_id: info.lastInsertRowid, title: finalTitle, question_ids: ids, total_questions: ids.length }, note ? { note } : {}));
 });
 app.get("/api/exams", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT * FROM exam_records WHERE user_id = ? ORDER BY exam_id DESC").all(req.user.user_id);
@@ -737,6 +998,90 @@ app.get("/api/exams/pool", requireAuth, (req, res) => {
   const { sql, params } = poolQuery(req.user.user_id, f);
   const pool = db.prepare(sql).all(...params);
   res.json({ count: pool.length });
+});
+
+// ---------- 手動挑題列表 ----------
+// 用返組卷篩選（多考試、多難度、來源）加關鍵字，淨係回傳挑題需要嘅欄位，
+// 絕對唔含答案同解析；簡答題本身已經唔喺 poolQuery 入面，唔會出現喺度。
+// 同樣要放喺 /api/exams/:id 前面。
+app.get("/api/exams/pick", requireAuth, (req, res) => {
+  const f = parseExamFilters(req.query || {});
+  const q = String((req.query || {}).q || "").trim();
+  const { sql, params } = poolQuery(req.user.user_id, f);
+  let finalSql = sql;
+  const finalParams = params.slice();
+  if (q) { finalSql += " AND (content LIKE ? OR question_id LIKE ?)"; finalParams.push("%" + q + "%", "%" + q + "%"); }
+  finalSql += " ORDER BY question_id";
+  const all = db.prepare(finalSql).all(...finalParams);
+  const shown = all.slice(0, 100).map((r) => ({ question_id: r.question_id, type: r.type, content: r.content, options: safeJson(r.options, []), exam: r.exam, difficulty: r.difficulty }));
+  res.json({ total: all.length, questions: shown });
+});
+
+// ---------- 組卷模板 ----------
+// config 係一組規則：[{exam, count, difficulties?, source?}]，difficulties 唔填即全部難度，source 唔填即 all。
+function validateTemplateConfig(config) {
+  if (!Array.isArray(config) || config.length === 0) return { ok: false, error: "模板至少要有一條規則。" };
+  if (config.length > 20) return { ok: false, error: "模板最多 20 條規則。" };
+  const rules = [];
+  for (const r of config) {
+    if (!r || typeof r !== "object") return { ok: false, error: "規則格式唔啱。" };
+    const exam = String(r.exam || "").trim();
+    if (!exam) return { ok: false, error: "每條規則都要填考試。" };
+    if (exam.length > 50) return { ok: false, error: "考試名稱唔可以超過 50 個字。" };
+    const count = Number(r.count);
+    if (!Number.isInteger(count) || count < 1 || count > 100) return { ok: false, error: "每條規則題數要係 1 至 100。" };
+    const difficulties = Array.isArray(r.difficulties) ? r.difficulties.map((x) => String(x)).filter((x) => ["簡單", "中等", "困難"].includes(x)) : [];
+    const source = EXAM_SOURCES.includes(String(r.source || "")) ? String(r.source) : "all";
+    rules.push({ exam, count, difficulties, source });
+  }
+  return { ok: true, rules };
+}
+function templateSummary(rules) {
+  return (Array.isArray(rules) ? rules : []).map((r) => r.exam + " " + r.count + " 題").join("、");
+}
+function publicTemplate(t) {
+  const rules = safeJson(t.config, []);
+  return { template_id: t.template_id, title: t.title, config: rules, summary: templateSummary(rules), created_by: t.created_by, created_by_name: t.created_by_name || "", created_at: t.created_at };
+}
+function getTemplateRow(id) {
+  return db.prepare("SELECT t.*, u.username AS created_by_name FROM paper_templates t LEFT JOIN users u ON u.user_id = t.created_by WHERE t.template_id = ?").get(id);
+}
+// 模板係共用嘅：任何登入用戶都睇到、開卷用到；新增、修改、刪除只限管理員。
+app.get("/api/templates", requireAuth, (req, res) => {
+  const rows = db.prepare("SELECT t.*, u.username AS created_by_name FROM paper_templates t LEFT JOIN users u ON u.user_id = t.created_by ORDER BY t.template_id").all();
+  res.json({ templates: rows.map(publicTemplate) });
+});
+app.post("/api/templates", requireAuth, requireAdmin, (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || "").trim();
+  if (!title) return res.status(400).json({ error: "請填寫模板標題。" });
+  if (title.length > 100) return res.status(400).json({ error: "標題唔可以超過 100 個字。" });
+  const v = validateTemplateConfig(b.config);
+  if (!v.ok) return res.status(400).json({ error: v.error });
+  const info = db.prepare("INSERT INTO paper_templates (title, config, created_by, created_at) VALUES (?,?,?,?)").run(title, JSON.stringify(v.rules), req.user.user_id, nowIso());
+  res.json({ template: publicTemplate(getTemplateRow(info.lastInsertRowid)) });
+});
+app.put("/api/templates/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: "模板編號唔啱。" });
+  const old = getTemplateRow(id);
+  if (!old) return res.status(404).json({ error: "搵唔到呢個模板。" });
+  const b = req.body || {};
+  const title = String(b.title || "").trim();
+  if (!title) return res.status(400).json({ error: "請填寫模板標題。" });
+  if (title.length > 100) return res.status(400).json({ error: "標題唔可以超過 100 個字。" });
+  const v = validateTemplateConfig(b.config);
+  if (!v.ok) return res.status(400).json({ error: v.error });
+  db.prepare("UPDATE paper_templates SET title = ?, config = ? WHERE template_id = ?").run(title, JSON.stringify(v.rules), id);
+  res.json({ template: publicTemplate(getTemplateRow(id)) });
+});
+app.delete("/api/templates/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: "模板編號唔啱。" });
+  const old = getTemplateRow(id);
+  if (!old) return res.status(404).json({ error: "搵唔到呢個模板。" });
+  db.prepare("DELETE FROM paper_templates WHERE template_id = ?").run(id);
+  res.json({ ok: true });
 });
 app.get("/api/exams/:id", requireAuth, (req, res) => {
   const rec = db.prepare("SELECT * FROM exam_records WHERE exam_id = ? AND user_id = ?").get(req.params.id, req.user.user_id);
@@ -938,7 +1283,7 @@ app.get("/api/admin/export/questions", requireAuth, requireAdmin, (req, res) => 
   const rows = db.prepare(sql).all(...params);
   const lines = [CSV_HEADERS.join(",")];
   for (const r of rows) {
-    lines.push([r.question_id, r.type, r.content, safeJson(r.options, []).join("|"), r.answer, r.explanation, r.exam, r.difficulty].map(csvEscape).join(","));
+    lines.push([r.question_id, r.type, r.content, safeJson(r.options, []).join("|"), r.answer, r.explanation, r.exam, r.difficulty, mediaCellForCsv(r.media)].map(csvEscape).join(","));
   }
   sendCsvDownload(res, "questions-" + dateStamp() + ".csv", lines.join("\n"));
 });
@@ -991,8 +1336,8 @@ app.post("/api/admin/restore", requireAuth, requireAdmin, (req, res) => {
         const c = count("questions");
         if (!q || typeof q !== "object" || !q.question_id || !q.type || !q.content || q.answer == null) { c.skipped++; continue; }
         const exists = db.prepare("SELECT 1 FROM questions WHERE question_id = ?").get(q.question_id);
-        db.prepare("INSERT INTO questions (question_id,type,content,options,answer,explanation,exam,difficulty,created_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(question_id) DO UPDATE SET type=excluded.type, content=excluded.content, options=excluded.options, answer=excluded.answer, explanation=excluded.explanation, exam=excluded.exam, difficulty=excluded.difficulty")
-          .run(q.question_id, q.type, q.content, typeof q.options === "string" ? q.options : JSON.stringify(q.options || []), q.answer, q.explanation || "", q.exam || "", q.difficulty || "中等", q.created_at || nowIso());
+        db.prepare("INSERT INTO questions (question_id,type,content,options,answer,explanation,exam,difficulty,media,created_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(question_id) DO UPDATE SET type=excluded.type, content=excluded.content, options=excluded.options, answer=excluded.answer, explanation=excluded.explanation, exam=excluded.exam, difficulty=excluded.difficulty, media=excluded.media")
+          .run(q.question_id, q.type, q.content, typeof q.options === "string" ? q.options : JSON.stringify(q.options || []), q.answer, q.explanation || "", q.exam || "", q.difficulty || "中等", mediaJson(q.media), q.created_at || nowIso());
         if (exists) c.updated++; else c.inserted++;
       }
       // 帳號：先按 user_id，再按 username；保留原有 user_id，先至唔會斷咗成績紀錄嘅關聯
@@ -1102,3 +1447,4 @@ app.listen(PORT, () => {
   console.log("考試系統獨立版已啟動：http://localhost:" + PORT);
   console.log("首次開啟請先建立管理員帳號，之後考生可以自行註冊。");
 });
+
