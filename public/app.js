@@ -306,9 +306,9 @@ async function viewDashboard() {
       '<h3>難度分佈：' + a.byDifficulty.map((x) => esc(x.difficulty) + " " + x.n).join("、") + '</h3>' +
       '<h3>各考試題目分佈</h3>' + (a.byExam.length === 0 ? '<p class="muted">題庫暫時係空。</p>' : a.byExam.map((x) => '<div class="bar-row"><div class="lbl"><span>' + esc(x.exam) + '</span><span>' + x.n + ' 題</span></div><div class="bar blue"><div style="width:' + Math.max(4, Math.round((x.n / maxN) * 100)) + '%"></div></div></div>').join("")) + '</div>' +
       '<div id="analyticsCard"></div>' +
-      '<div class="card"><h2>備份與匯出（管理員）</h2>' +
+      '<div class="card"><h2>備份與匯出（管理員）</h2><p class="muted">版本 1.1.0（2026-11-17）</p>' +
       '<p><button id="bkQ">⬇ 匯出題目 CSV（全部）</button> <button id="bkU">⬇ 匯出學生帳號 CSV</button> <button id="bkAll" class="primary">⬇ 下載成站備份 JSON</button></p>' +
-      '<p class="muted">題目 CSV 格式同匯入範本一樣，可以直接用嚟備份或者搬去另一部機。學生帳號 CSV 唔包含密碼雜湊。成站備份 JSON 包晒題目、帳號、成績、答題紀錄、留言、收藏同登入狀態。備份 JSON 唔包上傳咗嘅圖片／影片檔案本身，要另外經 SFTP 下載 data/uploads/ 一齊備份。</p>' +
+      '<p class="muted">題目 CSV 格式同匯入範本一樣，可以直接用嚟備份或者搬去另一部機。學生帳號 CSV 唔包含密碼雜湊。成站備份 JSON 包晒題目、帳號、成績、答題紀錄、留言、收藏、登入狀態、模擬考草稿同組卷模板。備份 JSON 唔包上傳咗嘅圖片／影片檔案本身，要另外經 SFTP 下載 data/uploads/ 一齊備份。</p>' +
       '<p class="muted">⚠️ 備份檔包含密碼雜湊，唔好公開分享，妥善保存。遺失咗人哋攞到就可以離線慢慢試密碼。</p>' +
       '<p><label>還原備份 JSON</label><input type="file" id="rsFile" accept=".json,application/json"><button id="rsGo">還原備份</button></p>' +
       '<p class="muted">還原用合併方式：按編號 / 帳號逐行新增或者更新，唔會清空現有資料；失敗會成個取消，唔會還原一半。還原前建議先下載一份最新備份。</p>' +
@@ -398,6 +398,7 @@ function renderPracticeQ() {
   });
   document.getElementById("pNext").addEventListener("click", () => { practiceState.idx++; practiceState.answered = false; renderPracticeQ(); });
   document.getElementById("pSubmit").addEventListener("click", async () => {
+    if (practiceState.answeredQ === q.question_id) return; // 呢題已經交過，唔重複記分
     let ua = "";
     if (q.type === "簡答") ua = document.getElementById("pAns").value;
     else if (q.type === "多選") ua = Array.from(area.querySelectorAll(".pOpt:checked")).map((x) => x.value).sort().join("");
@@ -405,6 +406,7 @@ function renderPracticeQ() {
     if (!ua) { document.getElementById("pResult").innerHTML = '<p class="muted">請先揀答案。</p>'; return; }
     try {
       const d = await api("/api/practice/answer", { method: "POST", body: { question_id: q.question_id, user_answer: ua } });
+      practiceState.answeredQ = q.question_id;
       const res = document.getElementById("pResult");
       if (q.type === "簡答") {
         res.innerHTML = '<details class="explain" open><summary>參考答案</summary><p>' + esc(d.reference || "") + '</p><p>' + esc(d.explanation || "") + '</p>' + explanationMediaHtml(q) + '</details><p>你覺得自己答啱定答錯？ <button id="selfOk">我答對了</button> <button id="selfNo">我答錯了</button></p>';
@@ -742,7 +744,10 @@ async function viewExamList() {
 async function openExam(id) {
   const d = await api("/api/exams/" + id);
   if (d.exam.status === "已完成") { await showReport(id); return; }
-  examState = { id, exam: d.exam, questions: d.questions, answers: d.answers || {}, marked: d.marked || [], idx: d.firstUnanswered >= 0 ? d.firstUnanswered : 0, savedAt: "", saveFail: false };
+  // 繼續作答先叫 resume：將暫停咗嘅時間由計時入面扣返出嚟
+  let live = d;
+  try { live = await api("/api/exams/" + id + "/resume", { method: "POST", body: {} }); } catch (e) {}
+  examState = { id, exam: live.exam, questions: live.questions, answers: live.answers || {}, marked: live.marked || [], idx: live.firstUnanswered >= 0 ? live.firstUnanswered : 0, savedAt: "", saveFail: false };
   renderExamPage();
 }
 async function saveProgress() {
@@ -823,8 +828,8 @@ async function viewQuestions() {
   if (me.role !== "admin") { mainEl().innerHTML = '<div class="card"><p>只有管理員先可以用題庫管理。</p></div>'; return; }
   const m = mainEl();
   m.innerHTML = '<div class="card"><h2>題庫管理</h2><div style="display:flex;gap:8px;flex-wrap:wrap"><input id="qSearch" placeholder="關鍵字或者編號" style="flex:2;min-width:160px"><select id="qExamF" style="flex:1"><option value="">全部考試</option></select><select id="qTypeF" style="flex:1"><option value="">全部題型</option><option>單選</option><option>多選</option><option>判斷</option><option>簡答</option></select><select id="qDiffF" style="flex:1"><option value="">全部難度</option><option>簡單</option><option>中等</option><option>困難</option></select></div><p><button class="primary" id="qFilter">篩選</button> <button id="qAdd">新增題目</button> <span id="qMsg" class="muted"></span></p></div>' +
-    '<div class="card"><h2>CSV 批次匯入</h2><p><button id="tplDl">⬇ 下載 CSV 範本（含示例）</button> <button id="tplView">睇範本內容</button> <button id="tplCopy">一鍵複製範本</button></p><p class="muted">範本用 exam 欄位，值係 VTS 或者 430，入面有 4 行示例（單選、多選、判斷、簡答各一），匯入前要刪走示例行。匯入同時兼容舊 chapter / 章節欄位名。media 欄可以留空；有連結用 ; 分隔，前面加前綴指定位置（stem:題幹、optB:選項 B、explanation:解析，唔寫前綴當題幹），例如 stem:https://…/圖.jpg;optB:https://…/圖.png。</p><div id="tplArea"></div><label>直接貼上 CSV 內容</label><textarea id="csvText" placeholder="貼上 CSV 內容，欄位：question_id,type,content,options,answer,explanation,exam,difficulty,media"></textarea><label>重複編號處理</label><select id="csvMode"><option value="skip">跳過</option><option value="overwrite">覆蓋</option></select><p><button class="primary" id="csvGo">匯入</button> <span id="csvMsg" class="muted"></span></p><div id="csvErr"></div></div>' +
-    '<div class="card"><h2>批量管理</h2><p><button id="selPage">全選今頁</button> <button id="selAll">全選篩選結果</button> <button id="selNone">取消全選</button> <span id="selCount" class="muted">已選 0 題</span></p><p><button id="batchDel" class="danger">批量刪除</button> <button id="batchExam">批量改分類</button> <button id="batchDiff">批量改難度</button> <button id="expQ">⬇ 匯出題目 CSV（目前篩選）</button> <span id="batchMsg" class="muted"></span></p><p class="muted">批量刪除會一併清除呢啲題目嘅答題紀錄、收藏同相關留言；已經喺已完成考卷入面嘅題目，成績報告會顯示「題目已刪除」，分數維持不變。列表一次過顯示全部篩選結果，所以全選今頁同全選篩選結果係同一批題。</p></div>' +
+    '<div class="card"><h2>CSV 批次匯入</h2><p><button id="tplDl">⬇ 下載 CSV 範本（含示例）</button> <button id="tplView">睇範本內容</button> <button id="tplCopy">一鍵複製範本</button></p><p class="muted">範本用 exam 欄位，值係 VTS 或者 430，入面有 4 行示例（單選、多選、判斷、簡答各一），匯入前要刪走示例行。匯入同時兼容舊 chapter / 章節欄位名。media 欄可以留空；有連結用 ; 分隔，前面加前綴指定位置（stem:題幹、optB:選項 B、explanation:解析，唔寫前綴當題幹），例如 stem:https://…/圖.jpg;optB:https://…/圖.png。</p><div id="tplArea"></div><label>或者揀一個 CSV 檔案（會自動讀入下面個格）</label><input type="file" id="csvFile" accept=".csv,text/csv"><label>直接貼上 CSV 內容</label><textarea id="csvText" placeholder="貼上 CSV 內容，欄位：question_id,type,content,options,answer,explanation,exam,difficulty,media"></textarea><label>重複編號處理</label><select id="csvMode"><option value="skip">跳過</option><option value="overwrite">覆蓋</option></select><p><button class="primary" id="csvGo">匯入</button> <span id="csvMsg" class="muted"></span></p><div id="csvErr"></div></div>' +
+    '<div class="card"><h2>批量管理</h2><p><button id="selPage">全選今頁</button> <button id="selAll">全選篩選結果</button> <button id="selNone">取消全選</button> <span id="selCount" class="muted">已選 0 題</span></p><p><button id="batchDel" class="danger">批量刪除</button> <button id="batchExam">批量改分類</button> <button id="batchDiff">批量改難度</button> <button id="expQ">⬇ 匯出題目 CSV（目前篩選）</button> <span id="batchMsg" class="muted"></span></p><p class="muted">批量刪除會一併清除呢啲題目嘅答題紀錄、收藏同相關留言；新開嘅模擬考有題目快照，刪題唔會影響佢嘅成績報告，淨係冇快照嘅舊卷先會顯示「題目已刪除」，分數維持不變。列表一次最多顯示 500 題，所以全選篩選結果只會揀到已載入嗰 500 題，題庫大嗰陣請先用篩選縮小範圍。</p></div>' +
     '<div id="qList"></div>';
   let qSelected = new Set();
   let loadedQs = [];
@@ -847,6 +852,12 @@ async function viewQuestions() {
       document.getElementById("csvErr").innerHTML = d.errors.length ? d.errors.map((e) => '<p class="muted">• ' + esc(e) + '</p>').join("") : "";
       loadList();
     } catch (e) { document.getElementById("csvMsg").textContent = e.message; }
+  });
+  document.getElementById("csvFile").addEventListener("change", async (ev) => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    try { document.getElementById("csvText").value = await f.text(); document.getElementById("csvMsg").textContent = "已讀入「" + f.name + "」，檢查無誤就可以撳匯入。"; }
+    catch (e) { document.getElementById("csvMsg").textContent = "讀唔到呢個檔案，請改用貼上 CSV 內容。"; }
   });
   function updateSelCount() {
     const el = document.getElementById("selCount");
@@ -871,7 +882,8 @@ async function viewQuestions() {
     const list = document.getElementById("qList");
     updateSelCount();
     if (d.questions.length === 0) { list.innerHTML = '<div class="card"><p class="muted">暫時未有題目，請新增或者匯入。</p></div>'; return; }
-    list.innerHTML = d.questions.map((qq) => '<div class="card"><p><label><input type="checkbox" class="qSel" data-id="' + esc(qq.question_id) + '"' + (qSelected.has(qq.question_id) ? " checked" : "") + '> 勾選呢題</label></p><div><span class="pill">' + esc(qq.exam) + '</span><span class="pill">' + esc(qq.type) + '</span><span class="pill">' + esc(qq.difficulty) + '</span><span class="pill">' + esc(qq.question_id) + '</span></div><h3>' + esc(qq.content) + '</h3><p><button data-edit="' + esc(qq.question_id) + '">修改</button> <button data-prev="' + esc(qq.question_id) + '">預覽</button> <button data-del="' + esc(qq.question_id) + '" class="danger">刪除</button></p></div>').join("");
+    const totalTxt = (d.total != null ? "共 " + d.total + " 題" : "") + (d.total != null && d.total > d.questions.length ? "，只顯示首 " + d.questions.length + " 題，請用篩選縮小範圍" : "");
+    list.innerHTML = (totalTxt ? '<p class="muted">' + totalTxt + '</p>' : "") + d.questions.map((qq) => '<div class="card"><p><label><input type="checkbox" class="qSel" data-id="' + esc(qq.question_id) + '"' + (qSelected.has(qq.question_id) ? " checked" : "") + '> 勾選呢題</label></p><div><span class="pill">' + esc(qq.exam) + '</span><span class="pill">' + esc(qq.type) + '</span><span class="pill">' + esc(qq.difficulty) + '</span><span class="pill">' + esc(qq.question_id) + '</span></div><h3>' + esc(qq.content) + '</h3><p><button data-edit="' + esc(qq.question_id) + '">修改</button> <button data-prev="' + esc(qq.question_id) + '">預覽</button> <button data-del="' + esc(qq.question_id) + '" class="danger">刪除</button></p></div>').join("");
     list.querySelectorAll(".qSel").forEach((c) => c.addEventListener("change", () => {
       if (c.checked) qSelected.add(c.dataset.id); else qSelected.delete(c.dataset.id);
       updateSelCount();

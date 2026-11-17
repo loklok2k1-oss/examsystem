@@ -30,6 +30,9 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const db = new DatabaseSync(DB_PATH);
 db.exec("PRAGMA foreign_keys = ON");
+db.exec("PRAGMA journal_mode = WAL");
+db.exec("PRAGMA busy_timeout = 5000");
+db.exec("PRAGMA synchronous = NORMAL");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -56,6 +59,7 @@ db.exec(`
     user_id INTEGER NOT NULL,
     title TEXT NOT NULL,
     question_list TEXT NOT NULL DEFAULT '[]',
+    snapshot TEXT NOT NULL DEFAULT '',
     score INTEGER,
     total_questions INTEGER NOT NULL DEFAULT 0,
     start_time TEXT NOT NULL,
@@ -115,6 +119,16 @@ db.exec(`
   if (!cols.some((c) => c.name === "media")) {
     db.exec("ALTER TABLE questions ADD COLUMN media TEXT NOT NULL DEFAULT '[]'");
     console.log("資料庫遷移：questions 表已加 media 欄位（題目圖片／影片）。");
+  }
+})();
+
+// ---------- 遷移：舊資料庫嘅 exam_records 表加 snapshot 欄位 ----------
+// 開卷快照：開卷嗰陣將成份卷嘅題目全文存起，之後改題、刪題都唔影響舊卷。
+(function migrateSnapshotColumn() {
+  const cols = db.prepare("PRAGMA table_info(exam_records)").all();
+  if (!cols.some((c) => c.name === "snapshot")) {
+    db.exec("ALTER TABLE exam_records ADD COLUMN snapshot TEXT NOT NULL DEFAULT ''");
+    console.log("資料庫遷移：exam_records 表已加 snapshot 欄位（開卷時題目快照）。");
   }
 })();
 
@@ -467,11 +481,13 @@ app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("Content-Security-Policy", "default-src 'self'; img-src 'self' https: data:; media-src 'self' https:; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
   next();
 });
 app.use(express.json({ limit: "20mb" })); // 還原備份 JSON 可能比較大
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(ROOT, "public")));
+app.use(express.static(path.join(ROOT, "public"), { setHeaders: (res, filePath) => { if (/\.(html|js)$/.test(filePath)) res.setHeader("Cache-Control", "no-cache"); } }));
 // 題目上傳嘅圖片／影片：檔案實體存喺 data/uploads/（更新成個資料夾覆蓋嗰陣唔會刪走），
 // 用 /uploads 掛出嚟。副檔名已經喺上傳嗰陣驗證過（唔接受 svg / html 等），加埋 nosniff header。
 app.use("/uploads", express.static(UPLOAD_DIR));
@@ -509,6 +525,10 @@ function createSessionFor(userId) {
   db.prepare("INSERT INTO sessions (session_id, user_id, created_at) VALUES (?,?,?)").run(token, userId, nowIso());
   return token;
 }
+
+app.get(["/health", "/api/health"], (req, res) => {
+  res.json({ ok: true, app: "exam-system-standalone", version: "1.1.0", time: nowIso() });
+});
 
 app.get("/api/bootstrap", (req, res) => {
   const n = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
@@ -620,16 +640,19 @@ app.post("/api/upload", requireAuth, requireAdmin, (req, res) => {
 // ---------- 題庫 ----------
 app.get("/api/questions", requireAuth, (req, res) => {
   const { exam, difficulty, type, q } = req.query;
-  let sql = "SELECT * FROM questions WHERE 1=1";
-  const params = [];
-  if (exam) { sql += " AND exam = ?"; params.push(exam); }
-  if (difficulty) { sql += " AND difficulty = ?"; params.push(difficulty); }
-  if (type) { sql += " AND type = ?"; params.push(type); }
-  if (q) { sql += " AND (content LIKE ? OR question_id LIKE ?)"; params.push("%" + q + "%", "%" + q + "%"); }
-  sql += " ORDER BY question_id";
-  const rows = db.prepare(sql).all(...params);
+  // 分頁：預設一次最多 500 題，題庫再大都唔會一次過拖晒返嚟拖慢手機；前端會顯示總數
+  const limit = Math.max(1, Math.min(5000, Number(req.query.limit) || 500));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  let where = " WHERE 1=1";
+  const params2 = [];
+  if (exam) { where += " AND exam = ?"; params2.push(exam); }
+  if (difficulty) { where += " AND difficulty = ?"; params2.push(difficulty); }
+  if (type) { where += " AND type = ?"; params2.push(type); }
+  if (q) { where += " AND (content LIKE ? OR question_id LIKE ?)"; params2.push("%" + q + "%", "%" + q + "%"); }
+  const total = db.prepare("SELECT COUNT(*) AS n FROM questions" + where).get(...params2).n;
+  const rows = db.prepare("SELECT * FROM questions" + where + " ORDER BY question_id LIMIT ? OFFSET ?").all(...params2, limit, offset);
   // 考生唔可以直接由列表拎到答案：非管理員一律隱藏答案。題庫管理頁本身只限管理員用，唔受影響。
-  res.json({ questions: rows.map((r) => req.user.role === "admin" ? rowToQuestion(r) : hideAnswer(rowToQuestion(r))) });
+  res.json({ questions: rows.map((r) => req.user.role === "admin" ? rowToQuestion(r) : hideAnswer(rowToQuestion(r))), total, limit, offset });
 });
 app.get("/api/questions/exams", requireAuth, (req, res) => {
   const rows = db.prepare("SELECT DISTINCT exam FROM questions WHERE exam != '' ORDER BY exam").all();
@@ -860,14 +883,25 @@ app.get("/api/wrong", requireAuth, (req, res) => {
 });
 
 // ---------- 模擬考 ----------
-function examQuestionsFor(record) {
+// 開卷快照：開卷嗰陣將成份卷嘅題目全文（含答案、解析、媒體）存入 exam_records.snapshot，
+// 之後管理員改題、刪題都唔會影響呢份卷嘅作答、計分同成績報告。舊卷冇快照就退回即時讀題庫。
+function examFullQuestions(record) {
   const ids = safeJson(record.question_list, []);
   if (ids.length === 0) return [];
+  const snap = record.snapshot ? safeJson(record.snapshot, null) : null;
+  if (Array.isArray(snap) && snap.length > 0) {
+    const byId = {};
+    for (const q of snap) if (q && q.question_id) byId[q.question_id] = q;
+    return ids.map((id) => byId[id]).filter(Boolean);
+  }
   const ph = ids.map(() => "?").join(",");
   const rows = db.prepare("SELECT * FROM questions WHERE question_id IN (" + ph + ")").all(...ids);
   const byId = {};
-  for (const r of rows) byId[r.question_id] = r;
-  return ids.map((id) => byId[id]).filter(Boolean).map((r) => hideAnswer(rowToQuestion(r)));
+  for (const r of rows) byId[r.question_id] = rowToQuestion(r);
+  return ids.map((id) => byId[id]).filter(Boolean);
+}
+function examQuestionsFor(record) {
+  return examFullQuestions(record).map((q) => hideAnswer(q));
 }
 // ---------- 模擬考組卷篩選（POST /api/exams 同 GET /api/exams/pool 共用） ----------
 const EXAM_SOURCES = ["all", "unanswered", "answered", "wrong"];
@@ -984,7 +1018,12 @@ app.post("/api/exams", requireAuth, (req, res) => {
     ids = pool.slice(0, count).map((r) => r.question_id);
   }
   const finalTitle = title || defaultTitle;
-  const info = db.prepare("INSERT INTO exam_records (user_id, title, question_list, score, total_questions, start_time, status) VALUES (?,?,?,?,?,?,?)").run(req.user.user_id, finalTitle, JSON.stringify(ids), null, ids.length, nowIso(), "進行中");
+  // 開卷快照：即刻將題目全文存起，之後改題、刪題都唔影響呢份卷
+  const snapRows = ids.length ? db.prepare("SELECT * FROM questions WHERE question_id IN (" + ids.map(() => "?").join(",") + ")").all(...ids) : [];
+  const snapById = {};
+  for (const r of snapRows) snapById[r.question_id] = rowToQuestion(r);
+  const snapshot = JSON.stringify(ids.map((id) => snapById[id]).filter(Boolean));
+  const info = db.prepare("INSERT INTO exam_records (user_id, title, question_list, snapshot, score, total_questions, start_time, status) VALUES (?,?,?,?,?,?,?,?)").run(req.user.user_id, finalTitle, JSON.stringify(ids), snapshot, null, ids.length, nowIso(), "進行中");
   res.json(Object.assign({ exam_id: info.lastInsertRowid, title: finalTitle, question_ids: ids, total_questions: ids.length }, note ? { note } : {}));
 });
 app.get("/api/exams", requireAuth, (req, res) => {
@@ -1093,6 +1132,28 @@ app.get("/api/exams/:id", requireAuth, (req, res) => {
   const firstUnanswered = questions.findIndex((q) => answers[q.question_id] == null || answers[q.question_id] === "");
   res.json({ exam: { exam_id: rec.exam_id, title: rec.title, score: rec.score, total_questions: rec.total_questions, start_time: rec.start_time, end_time: rec.end_time, status: rec.status }, questions, answers, marked, firstUnanswered });
 });
+app.post("/api/exams/:id/resume", requireAuth, (req, res) => {
+  const rec = db.prepare("SELECT * FROM exam_records WHERE exam_id = ? AND user_id = ?").get(req.params.id, req.user.user_id);
+  if (!rec) return res.status(404).json({ error: "搵唔到呢份考卷。" });
+  if (rec.status !== "進行中") return res.status(400).json({ error: "呢份卷已經交咗，唔可以再繼續。" });
+  // 暫停時間唔計入用時：將 start_time 向後移（而家減去上次自動暫存時間），
+  // 差距細過 5 秒當連續作答，唔郁。重複叫都唔會重複移，因為每次都會更新暫存時間。
+  const prog = db.prepare("SELECT * FROM exam_progress WHERE exam_id = ?").get(req.params.id);
+  if (prog && prog.updated_at) {
+    const pausedMs = Date.now() - new Date(prog.updated_at).getTime();
+    if (!isNaN(pausedMs) && pausedMs > 5000) {
+      const newStart = new Date(new Date(rec.start_time).getTime() + pausedMs).toISOString();
+      db.prepare("UPDATE exam_records SET start_time = ? WHERE exam_id = ?").run(newStart, req.params.id);
+      rec.start_time = newStart;
+    }
+    db.prepare("UPDATE exam_progress SET updated_at = ? WHERE exam_id = ?").run(nowIso(), req.params.id);
+  }
+  const answers = prog ? safeJson(prog.answers, {}) : {};
+  const marked = prog ? safeJson(prog.marked, []) : [];
+  const questions = examQuestionsFor(rec);
+  const firstUnanswered = questions.findIndex((q) => answers[q.question_id] == null || answers[q.question_id] === "");
+  res.json({ exam: { exam_id: rec.exam_id, title: rec.title, score: rec.score, total_questions: rec.total_questions, start_time: rec.start_time, end_time: rec.end_time, status: rec.status }, questions, answers, marked, firstUnanswered });
+});
 app.post("/api/exams/:id/progress", requireAuth, (req, res) => {
   const rec = db.prepare("SELECT * FROM exam_records WHERE exam_id = ? AND user_id = ?").get(req.params.id, req.user.user_id);
   if (!rec) return res.status(404).json({ error: "搵唔到呢份考卷。" });
@@ -1106,26 +1167,34 @@ app.post("/api/exams/:id/submit", requireAuth, (req, res) => {
   const rec = db.prepare("SELECT * FROM exam_records WHERE exam_id = ? AND user_id = ?").get(req.params.id, req.user.user_id);
   if (!rec) return res.status(404).json({ error: "搵唔到呢份考卷。" });
   if (rec.status === "已完成") return res.json({ ok: true, score: rec.score, total: rec.total_questions });
-  const prog = db.prepare("SELECT * FROM exam_progress WHERE exam_id = ?").get(req.params.id);
-  const answers = prog ? safeJson(prog.answers, {}) : {};
-  const ids = safeJson(rec.question_list, []);
-  let score = 0;
-  const now = nowIso();
-  const start = new Date(rec.start_time).getTime();
-  const duration = Math.max(0, Math.round((new Date(now).getTime() - start) / 1000));
-  const ins = db.prepare("INSERT INTO answer_records (exam_id, user_id, question_id, user_answer, is_correct, answer_time) VALUES (?,?,?,?,?,?)");
-  for (const qid of ids) {
-    const r = db.prepare("SELECT * FROM questions WHERE question_id = ?").get(qid);
-    if (!r) continue;
-    const q = rowToQuestion(r);
-    const ua = String(answers[qid] == null ? "" : answers[qid]);
-    const correct = gradeAnswer(q, ua);
-    if (correct) score++;
-    ins.run(req.params.id, req.user.user_id, qid, ua, correct ? 1 : 0, now);
-  }
-  db.prepare("UPDATE exam_records SET score = ?, end_time = ?, duration_sec = ?, status = '已完成' WHERE exam_id = ?").run(score, now, duration, req.params.id);
-  db.prepare("DELETE FROM exam_progress WHERE exam_id = ?").run(req.params.id);
-  res.json({ ok: true, score, total: ids.length, duration_sec: duration });
+  // 成個交卷包喺一個交易入面：先刪走呢份卷舊嘅答題紀錄再寫入，
+  // 萬一中途出錯成個取消，重交唔會重複計分。計分用開卷快照，唔怕中途改題。
+  const out = withTx(() => {
+    const prog = db.prepare("SELECT * FROM exam_progress WHERE exam_id = ?").get(req.params.id);
+    const answers = prog ? safeJson(prog.answers, {}) : {};
+    const qs = examFullQuestions(rec);
+    const byId = {};
+    for (const q of qs) byId[q.question_id] = q;
+    const ids = safeJson(rec.question_list, []);
+    let score = 0;
+    const now = nowIso();
+    const start = new Date(rec.start_time).getTime();
+    const duration = Math.max(0, Math.round((new Date(now).getTime() - start) / 1000));
+    db.prepare("DELETE FROM answer_records WHERE exam_id = ? AND user_id = ?").run(req.params.id, req.user.user_id);
+    const ins = db.prepare("INSERT INTO answer_records (exam_id, user_id, question_id, user_answer, is_correct, answer_time) VALUES (?,?,?,?,?,?)");
+    for (const qid of ids) {
+      const q = byId[qid];
+      if (!q) continue;
+      const ua = String(answers[qid] == null ? "" : answers[qid]);
+      const correct = gradeAnswer(q, ua);
+      if (correct) score++;
+      ins.run(req.params.id, req.user.user_id, qid, ua, correct ? 1 : 0, now);
+    }
+    db.prepare("UPDATE exam_records SET score = ?, end_time = ?, duration_sec = ?, status = '已完成' WHERE exam_id = ?").run(score, now, duration, req.params.id);
+    db.prepare("DELETE FROM exam_progress WHERE exam_id = ?").run(req.params.id);
+    return { score, total: ids.length, duration_sec: duration };
+  });
+  res.json(Object.assign({ ok: true }, out));
 });
 app.get("/api/exams/:id/report", requireAuth, (req, res) => {
   const rec = db.prepare("SELECT * FROM exam_records WHERE exam_id = ? AND user_id = ?").get(req.params.id, req.user.user_id);
@@ -1134,12 +1203,15 @@ app.get("/api/exams/:id/report", requireAuth, (req, res) => {
   const byQ = {};
   for (const a of ans) byQ[a.question_id] = a;
   const ids = safeJson(rec.question_list, []);
+  const snapQs = examFullQuestions(rec);
+  const snapById = {};
+  for (const q of snapQs) snapById[q.question_id] = q;
   const items = ids.map((qid) => {
-    const r = db.prepare("SELECT * FROM questions WHERE question_id = ?").get(qid);
     const a = byQ[qid];
-    // 題目已經喺題庫刪除：唔好成項消失，要顯示「題目已刪除」，分數同總題數維持不變
-    if (!r) return { deleted: true, question_id: qid, user_answer: a ? a.user_answer : "", is_correct: a ? !!a.is_correct : false };
-    const q = rowToQuestion(r);
+    // 有快照就用開卷嗰陣嘅題目原文；冇快照（舊卷）先即時讀題庫。
+    // 題目已經喺題庫刪除、又冇快照：唔好成項消失，要顯示「題目已刪除」，分數同總題數維持不變
+    const q = snapById[qid];
+    if (!q) return { deleted: true, question_id: qid, user_answer: a ? a.user_answer : "", is_correct: a ? !!a.is_correct : false };
     return { question: q, user_answer: a ? a.user_answer : "", is_correct: a ? !!a.is_correct : false };
   });
   res.json({ exam: { exam_id: rec.exam_id, title: rec.title, score: rec.score, total_questions: rec.total_questions, duration_sec: rec.duration_sec, start_time: rec.start_time, end_time: rec.end_time }, items });
@@ -1303,7 +1375,7 @@ app.get("/api/admin/export/users", requireAuth, requireAdmin, (req, res) => {
 app.get("/api/admin/backup", requireAuth, requireAdmin, (req, res) => {
   const backup = {
     app: "exam-system-standalone",
-    version: 1,
+    version: 2,
     exported_at: nowIso(),
     questions: db.prepare("SELECT * FROM questions ORDER BY question_id").all(),
     users: db.prepare("SELECT * FROM users ORDER BY user_id").all(),
@@ -1313,6 +1385,7 @@ app.get("/api/admin/backup", requireAuth, requireAdmin, (req, res) => {
     favorites: db.prepare("SELECT * FROM favorites ORDER BY favorite_id").all(),
     sessions: db.prepare("SELECT * FROM sessions ORDER BY created_at").all(),
     exam_progress: db.prepare("SELECT * FROM exam_progress ORDER BY exam_id").all(),
+    paper_templates: db.prepare("SELECT * FROM paper_templates ORDER BY template_id").all(),
   };
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Content-Disposition", 'attachment; filename="exam-backup-' + dateStamp() + '.json"');
@@ -1323,7 +1396,7 @@ app.get("/api/admin/backup", requireAuth, requireAdmin, (req, res) => {
 app.post("/api/admin/restore", requireAuth, requireAdmin, (req, res) => {
   const b = req.body && req.body.backup ? req.body.backup : req.body;
   if (!b || typeof b !== "object" || Array.isArray(b)) return res.status(400).json({ error: "備份檔案格式唔啱，請上載由呢個系統匯出嘅備份 JSON。" });
-  const tables = ["questions", "users", "exam_records", "answer_records", "comments", "favorites", "sessions", "exam_progress"];
+  const tables = ["questions", "users", "exam_records", "answer_records", "comments", "favorites", "sessions", "exam_progress", "paper_templates"];
   for (const t of tables) {
     if (b[t] != null && !Array.isArray(b[t])) return res.status(400).json({ error: "備份檔案入面 " + t + " 唔係列表格式。" });
   }
@@ -1367,8 +1440,8 @@ app.post("/api/admin/restore", requireAuth, requireAdmin, (req, res) => {
         const c = count("exam_records");
         if (!e || typeof e !== "object" || e.exam_id == null || e.user_id == null || !e.title) { c.skipped++; continue; }
         const exists = db.prepare("SELECT 1 FROM exam_records WHERE exam_id = ?").get(e.exam_id);
-        db.prepare("INSERT INTO exam_records (exam_id,user_id,title,question_list,score,total_questions,start_time,end_time,duration_sec,status) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(exam_id) DO UPDATE SET user_id=excluded.user_id, title=excluded.title, question_list=excluded.question_list, score=excluded.score, total_questions=excluded.total_questions, start_time=excluded.start_time, end_time=excluded.end_time, duration_sec=excluded.duration_sec, status=excluded.status")
-          .run(e.exam_id, e.user_id, e.title, typeof e.question_list === "string" ? e.question_list : JSON.stringify(e.question_list || []), e.score == null ? null : e.score, e.total_questions || 0, e.start_time || nowIso(), e.end_time || null, e.duration_sec == null ? null : e.duration_sec, e.status || "已完成");
+        db.prepare("INSERT INTO exam_records (exam_id,user_id,title,question_list,snapshot,score,total_questions,start_time,end_time,duration_sec,status) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(exam_id) DO UPDATE SET user_id=excluded.user_id, title=excluded.title, question_list=excluded.question_list, snapshot=excluded.snapshot, score=excluded.score, total_questions=excluded.total_questions, start_time=excluded.start_time, end_time=excluded.end_time, duration_sec=excluded.duration_sec, status=excluded.status")
+          .run(e.exam_id, e.user_id, e.title, typeof e.question_list === "string" ? e.question_list : JSON.stringify(e.question_list || []), typeof e.snapshot === "string" ? e.snapshot : JSON.stringify(e.snapshot || []), e.score == null ? null : e.score, e.total_questions || 0, e.start_time || nowIso(), e.end_time || null, e.duration_sec == null ? null : e.duration_sec, e.status || "已完成");
         if (exists) c.updated++; else c.inserted++;
       }
       // 答題紀錄：按 record_id upsert
@@ -1417,6 +1490,15 @@ app.post("/api/admin/restore", requireAuth, requireAdmin, (req, res) => {
         db.prepare("INSERT INTO sessions (session_id,user_id,created_at) VALUES (?,?,?) ON CONFLICT(session_id) DO UPDATE SET user_id=excluded.user_id, created_at=excluded.created_at").run(s.session_id, s.user_id, s.created_at || nowIso());
         if (exists) c.updated++; else c.inserted++;
       }
+      // 組卷模板：按 template_id upsert（舊版備份冇呢個表，b.paper_templates 係 undefined 就跳過）
+      for (const t of b.paper_templates || []) {
+        const c = count("paper_templates");
+        if (!t || typeof t !== "object" || t.template_id == null || !t.title) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM paper_templates WHERE template_id = ?").get(t.template_id);
+        db.prepare("INSERT INTO paper_templates (template_id,title,config,created_by,created_at) VALUES (?,?,?,?,?) ON CONFLICT(template_id) DO UPDATE SET title=excluded.title, config=excluded.config, created_by=excluded.created_by, created_at=excluded.created_at")
+          .run(t.template_id, t.title, typeof t.config === "string" ? t.config : JSON.stringify(t.config || []), t.created_by || 0, t.created_at || nowIso());
+        if (exists) c.updated++; else c.inserted++;
+      }
       // 模擬考草稿：按 exam_id upsert
       for (const p of b.exam_progress || []) {
         const c = count("exam_progress");
@@ -1443,8 +1525,37 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "伺服器出錯，請稍後再試。" });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log("考試系統獨立版已啟動：http://localhost:" + PORT);
   console.log("首次開啟請先建立管理員帳號，之後考生可以自行註冊。");
 });
+server.on("error", (err) => {
+  if (err && err.code === "EADDRINUSE") console.error("啟動失敗：port " + PORT + " 已經畀其他程式用緊，請改 PORT 或者停咗嗰個程式再試。");
+  else console.error("啟動失敗：", err);
+  process.exit(1);
+});
+// 優雅關機：Railway / pm2 停程式會先送 SIGTERM，收到之後先停收新請求，
+// 再將 WAL 檢查點寫返入主資料庫，閂埋資料庫先至退出，唔會整壞個資料庫。
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("收到 " + signal + "，正在關機…");
+  server.close(() => {
+    try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch (e) {}
+    try { db.close(); } catch (e) {}
+    console.log("已關機。");
+    process.exit(0);
+  });
+  setTimeout(() => { console.error("關機超時，強制退出。"); process.exit(1); }, 10000).unref();
+}
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("uncaughtException", (err) => {
+  console.error("未處理嘅錯誤（程式會退出，等平台重新啟動）：", err);
+  try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch (e) {}
+  try { db.close(); } catch (e) {}
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => { console.error("未處理嘅 Promise 拒絕：", err); });
 
