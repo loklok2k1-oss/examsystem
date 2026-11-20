@@ -306,7 +306,7 @@ async function viewDashboard() {
       '<h3>難度分佈：' + a.byDifficulty.map((x) => esc(x.difficulty) + " " + x.n).join("、") + '</h3>' +
       '<h3>各考試題目分佈</h3>' + (a.byExam.length === 0 ? '<p class="muted">題庫暫時係空。</p>' : a.byExam.map((x) => '<div class="bar-row"><div class="lbl"><span>' + esc(x.exam) + '</span><span>' + x.n + ' 題</span></div><div class="bar blue"><div style="width:' + Math.max(4, Math.round((x.n / maxN) * 100)) + '%"></div></div></div>').join("")) + '</div>' +
       '<div id="analyticsCard"></div>' +
-      '<div class="card"><h2>備份與匯出（管理員）</h2><p class="muted">版本 1.1.0（2026-11-17）</p>' +
+      '<div class="card"><h2>備份與匯出（管理員）</h2><p class="muted">版本 1.2.0（2026-11-21）</p>' +
       '<p><button id="bkQ">⬇ 匯出題目 CSV（全部）</button> <button id="bkU">⬇ 匯出學生帳號 CSV</button> <button id="bkAll" class="primary">⬇ 下載成站備份 JSON</button></p>' +
       '<p class="muted">題目 CSV 格式同匯入範本一樣，可以直接用嚟備份或者搬去另一部機。學生帳號 CSV 唔包含密碼雜湊。成站備份 JSON 包晒題目、帳號、成績、答題紀錄、留言、收藏、登入狀態、模擬考草稿同組卷模板。備份 JSON 唔包上傳咗嘅圖片／影片檔案本身，要另外經 SFTP 下載 data/uploads/ 一齊備份。</p>' +
       '<p class="muted">⚠️ 備份檔包含密碼雜湊，唔好公開分享，妥善保存。遺失咗人哋攞到就可以離線慢慢試密碼。</p>' +
@@ -315,7 +315,12 @@ async function viewDashboard() {
       '<p id="bkMsg" class="muted">' + (lastRestoreResult ? "上次還原完成，數字如下。" : "") + '</p><div id="bkResult">' + restoreRowsHtml() + '</div></div>';
   }
   const trend = stats.trend.map((t) => esc(t.title) + "：" + t.score + "/" + t.total_questions).join("、") || "暫時未完成任何模擬考。";
-  m.innerHTML = '<h2>我嘅學習概況</h2><div class="grid4">' +
+  // 繼續考試放最頂：儀表板第一節
+  let myExams = [];
+  try { myExams = (await api("/api/exams")).exams; } catch (e) { myExams = []; }
+  const inProg = myExams.filter((e) => e.status !== "已完成");
+  const continueHtml = '<div class="card"><h2>繼續考試</h2>' + (inProg.length === 0 ? '<p class="muted">暫時冇進行中嘅模擬考。</p>' : inProg.map((e) => '<p><b>' + esc(e.title) + '</b> · ' + e.total_questions + ' 題 <button class="primary" data-open="' + e.exam_id + '">繼續作答</button></p>').join("")) + '</div>';
+  m.innerHTML = '<h2>我嘅學習概況</h2>' + continueHtml + '<div class="grid4">' +
     '<div class="stat"><div class="k">累計答題</div><div class="v">' + stats.total + '</div></div>' +
     '<div class="stat"><div class="k">整體正確率</div><div class="v">' + stats.accuracy + '%</div><div class="muted">答對 ' + stats.correct + ' 題</div></div>' +
     '<div class="stat"><div class="k">錯題本</div><div class="v">' + stats.wrong + ' 題</div><div class="muted">曾經答錯嘅題目</div></div>' +
@@ -323,6 +328,7 @@ async function viewDashboard() {
     '<div class="card"><p><button class="primary" id="goP">開始刷題</button> <button id="goE">開新模擬考</button> <button id="goW">去錯題本</button></p>' +
     '<h3>各考試正確率</h3>' + (stats.perExam.length === 0 ? '<p class="muted">暫時未有答題紀錄。</p>' : stats.perExam.map((x) => { const acc = x.total ? Math.round((x.correct / x.total) * 100) : 0; return '<div class="bar-row"><div class="lbl"><span>' + esc(x.exam) + '</span><span>' + x.correct + '/' + x.total + ' · ' + acc + '%</span></div><div class="bar"><div style="width:' + acc + '%"></div></div></div>'; }).join("")) +
     '<h3>歷次模擬考分數趨勢</h3><p class="muted">' + trend + '</p></div>' + adminHtml;
+  m.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => openExam(Number(b.dataset.open))));
   document.getElementById("goP").addEventListener("click", () => showView("practice"));
   document.getElementById("goE").addEventListener("click", () => showView("exam"));
   document.getElementById("goW").addEventListener("click", () => showView("wrong"));
@@ -505,7 +511,11 @@ async function viewExamList() {
   const sourceOpts = [["all", "全部題目"], ["unanswered", "未做過"], ["answered", "做過的"], ["wrong", "錯題"]];
   const isAdmin = me && me.role === "admin";
   let editingTemplateId = null;
-  m.innerHTML = '<div class="card"><h2>開新模擬考</h2><label>考卷名稱</label><input id="eTitle" placeholder="例如：VTS 模擬卷 01">' +
+  // 繼續考試放模擬考頁最頂，跟住先係我嘅考卷
+  const inProgExams = d.exams.filter((e) => e.status !== "已完成");
+  const continueHtml = '<div class="card"><h2>繼續考試</h2>' + (inProgExams.length === 0 ? '<p class="muted">暫時冇進行中嘅模擬考。</p>' : inProgExams.map((e) => '<p><b>' + esc(e.title) + '</b> · ' + e.total_questions + ' 題 <button class="primary" data-open="' + e.exam_id + '">繼續作答</button></p>').join("")) + '</div>';
+  const myExamsHtml = '<div class="card"><h2>我嘅考卷</h2>' + (d.exams.length === 0 ? '<p class="muted">暫時未開過模擬考。</p>' : d.exams.map((e) => '<p><b>' + esc(e.title) + '</b> · ' + esc(e.status) + (e.score != null ? ' · ' + e.score + '/' + e.total_questions + ' 分' : ' · ' + e.total_questions + ' 題') + ' <button data-open="' + e.exam_id + '">' + (e.status === "已完成" ? "睇成績" : "繼續作答") + '</button> <button data-del="' + e.exam_id + '" class="danger">刪除</button></p>').join("")) + '</div>';
+  m.innerHTML = continueHtml + myExamsHtml + '<div class="card"><h2>開新模擬考</h2><label>考卷名稱</label><input id="eTitle" placeholder="例如：VTS 模擬卷 01">' +
     '<label>考試（可剔多個）</label><div id="eExams">' + (examOpts.length === 0 ? '<p class="muted">題庫暫時係空，請先新增題目或者匯入題庫；匯入之後考試會自動出現。</p>' : examOpts.map((e) => '<label class="chk"><input type="checkbox" class="eExam" value="' + esc(e) + '" checked> ' + esc(e) + '</label>').join("")) + '</div>' +
     '<label>難度（可剔多個）</label><div id="eDiffs">' + diffOpts.map((d) => '<label class="chk"><input type="checkbox" class="eDiff" value="' + d + '" checked> ' + d + '</label>').join("") + '</div>' +
     '<label>題目來源（以你自己嘅作答紀錄計）</label><div id="eSources">' + sourceOpts.map((s, i) => '<label class="chk"><input type="radio" name="eSource" value="' + s[0] + '"' + (i === 0 ? " checked" : "") + '> ' + s[1] + '</label>').join("") + '</div>' +
@@ -526,9 +536,11 @@ async function viewExamList() {
         ? '<p class="muted">題庫暫時係空，請先新增題目或者匯入題庫，之後先可以新增模板。</p>'
         : '<label>模板標題</label><input id="tTitle" placeholder="例如：VTS 衝刺卷">' +
           '<div id="tRules"></div>' +
-          '<p><button id="tAddRule">加一條規則</button> <button id="tSave" class="primary">新增模板</button> <button id="tCancelEdit" style="display:none">取消修改</button> <span id="tMsg" class="muted"></span></p>') +
+          '<p><button id="tAddRule">加一條規則</button> <button id="tSave" class="primary">新增模板</button> <button id="tCancelEdit" style="display:none">取消修改</button> <span id="tMsg" class="muted"></span></p>' +
+          '<p><button id="tAll1">一鍵建立：全考試各1題</button> <button id="tAll2">一鍵建立：全考試各2題</button></p>' +
+          '<p class="muted">一鍵建立會按題庫現有嘅每一個考試各出 1 題（或者 2 題）建成普通模板，之後可以照樣修改或者刪除。</p>') +
       '<div id="tList"></div></div>' : '') +
-    '<div class="card"><h2>我嘅考卷</h2>' + (d.exams.length === 0 ? '<p class="muted">暫時未開過模擬考。</p>' : d.exams.map((e) => '<p><b>' + esc(e.title) + '</b> · ' + esc(e.status) + (e.score != null ? ' · ' + e.score + '/' + e.total_questions + ' 分' : ' · ' + e.total_questions + ' 題') + ' <button data-open="' + e.exam_id + '">' + (e.status === "已完成" ? "睇成績" : "繼續作答") + '</button> <button data-del="' + e.exam_id + '" class="danger">刪除</button></p>').join("")) + '</div>';
+    '';
   function currentFilters() {
     const examsSel = Array.from(m.querySelectorAll(".eExam:checked")).map((c) => c.value);
     const diffsSel = Array.from(m.querySelectorAll(".eDiff:checked")).map((c) => c.value);
@@ -736,6 +748,17 @@ async function viewExamList() {
         document.getElementById("tCancelEdit").style.display = "none";
         document.getElementById("tMsg").textContent = "";
       });
+      const buildAll = async (n) => {
+        const msgEl = document.getElementById("tMsg");
+        const config = exams.map((e) => ({ exam: e, count: n, difficulties: [], source: "all" }));
+        try {
+          await api("/api/templates", { method: "POST", body: { title: "全考試各" + n + "題", config } });
+          msgEl.textContent = "已建立「全考試各" + n + "題」模板（" + exams.length + " 個考試、合共 " + (exams.length * n) + " 題）。";
+          await refreshTemplates();
+        } catch (e) { msgEl.textContent = e.message; }
+      };
+      document.getElementById("tAll1").addEventListener("click", () => buildAll(1));
+      document.getElementById("tAll2").addEventListener("click", () => buildAll(2));
     }
   }
   m.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => openExam(Number(b.dataset.open))));

@@ -527,7 +527,7 @@ function createSessionFor(userId) {
 }
 
 app.get(["/health", "/api/health"], (req, res) => {
-  res.json({ ok: true, app: "exam-system-standalone", version: "1.1.0", time: nowIso() });
+  res.json({ ok: true, app: "exam-system-standalone", version: "1.2.0", time: nowIso() });
 });
 
 app.get("/api/bootstrap", (req, res) => {
@@ -1060,7 +1060,6 @@ app.get("/api/exams/pick", requireAuth, (req, res) => {
 // config 係一組規則：[{exam, count, difficulties?, source?}]，difficulties 唔填即全部難度，source 唔填即 all。
 function validateTemplateConfig(config) {
   if (!Array.isArray(config) || config.length === 0) return { ok: false, error: "模板至少要有一條規則。" };
-  if (config.length > 20) return { ok: false, error: "模板最多 20 條規則。" };
   const rules = [];
   for (const r of config) {
     if (!r || typeof r !== "object") return { ok: false, error: "規則格式唔啱。" };
