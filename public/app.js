@@ -69,6 +69,18 @@ async function downloadFile(path, fallbackName) {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
+// ---------- 上傳檔案（FormData，唔經 api() 因為要傳檔案） ----------
+async function uploadFile(path, formData) {
+  const token = storage.get("exam_token");
+  const headers = {};
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const res = await fetch(path, { method: "POST", headers, body: formData });
+  let data = {};
+  try { data = await res.json(); } catch (e) { data = {}; }
+  if (!res.ok) throw new Error(data.error || ("請求失敗（" + res.status + "）。"));
+  return data;
+}
+
 // ---------- 狀態 ----------
 let me = null;
 try { me = JSON.parse(storage.get("exam_user") || "null"); } catch (e) { me = null; }
@@ -102,14 +114,22 @@ async function renderAuth() {
   app.innerHTML = '<main><div class="card" style="max-width:520px;margin:40px auto"><h2>考試系統</h2>' +
     (first ? '<p class="muted">首次開啟，請先建立管理員帳號，之後考生可以自行註冊。</p>' : '<p class="muted">VTS 同 430 備考系統，請登入或者註冊。</p>') +
     '<div id="authTabs"><button id="tabLogin">登入</button> <button id="tabReg">' + (first ? '建立管理員' : '註冊') + '</button> <button id="themeBtn">🌙 深色 / 淺色</button></div>' +
-    '<div id="authForm"></div><p id="authMsg" class="muted"></p></div></main>';
+    '<div id="authForm"></div><p id="authMsg" class="muted"></p><p class="muted">做完題記得去錯題本，針對自己錯題溫習提升成績。</p></div></main>';
   document.getElementById("themeBtn").addEventListener("click", toggleTheme);
   const formEl = document.getElementById("authForm");
   function drawLogin() {
-    formEl.innerHTML = '<label>帳號</label><input id="aUser" autocomplete="username"><label>密碼</label><input id="aPass" type="password" autocomplete="current-password"><button class="primary" id="aGo">登入</button>';
+    formEl.innerHTML = '<label>帳號</label><input id="aUser" autocomplete="username"><label>密碼</label><input id="aPass" type="password" autocomplete="current-password"><button class="primary" id="aGo">登入</button>' +
+      '<p class="muted" style="margin-top:14px">唔想註冊？可以用示範帳號 <b>test</b>／密碼 <b>test</b> 直接登入試用。</p><button id="aDemo">用示範帳號登入</button>' +
+      '<p class="muted">示範帳號係共用嘅：練習記錄同錯題會同其他試用者混埋一齊。想要自己嘅錯題本，請註冊自己帳號。</p>';
     document.getElementById("aGo").addEventListener("click", async () => {
       try {
         const d = await api("/api/auth/login", { method: "POST", body: { username: document.getElementById("aUser").value, password: document.getElementById("aPass").value } });
+        setMe(d.user, d.token); view = "dashboard"; render();
+      } catch (e) { document.getElementById("authMsg").textContent = e.message; }
+    });
+    document.getElementById("aDemo").addEventListener("click", async () => {
+      try {
+        const d = await api("/api/auth/login", { method: "POST", body: { username: "test", password: "test" } });
         setMe(d.user, d.token); view = "dashboard"; render();
       } catch (e) { document.getElementById("authMsg").textContent = e.message; }
     });
@@ -136,13 +156,13 @@ async function renderAuth() {
 }
 
 // ---------- 主畫面 ----------
-const NAV = [["dashboard", "儀表板"], ["practice", "刷題"], ["exam", "模擬考"], ["wrong", "錯題本"], ["fav", "收藏"], ["comments", "留言板"], ["questions", "題庫管理"], ["accounts", "帳號管理"]];
+const NAV = [["dashboard", "儀表板"], ["practice", "刷題"], ["exam", "模擬考"], ["wrong", "錯題本"], ["fav", "收藏"], ["comments", "留言板"], ["trial", "下載試用"], ["questions", "題庫管理"], ["accounts", "帳號管理"], ["shop", "教材商店"]];
 async function render() {
   const app = document.getElementById("app");
   delete app.dataset.errorShown;
   if (!me) { await renderAuth(); return; }
   const admin = me.role === "admin";
-  const nav = NAV.filter((n) => admin || (n[0] !== "questions" && n[0] !== "accounts"));
+  const nav = NAV.filter((n) => admin || (n[0] !== "questions" && n[0] !== "accounts" && n[0] !== "shop"));
   app.innerHTML = '<header class="top"><div class="row"><h1>考試系統</h1><span class="who">' + esc(me.username) + ' · ' + (admin ? "管理員" : "考生") + '</span><span class="spacer"></span><button id="themeBtn">🌙</button><button id="pwBtn">改密碼</button><button id="outBtn" class="danger">登出</button></div></header>' +
     '<nav class="tabs">' + nav.map((n) => '<button data-v="' + n[0] + '" class="' + (view === n[0] ? "on" : "") + '">' + n[1] + '</button>').join("") + '</nav>' +
     '<main id="main"></main><div id="modalRoot"></div>';
@@ -157,8 +177,10 @@ async function render() {
     else if (view === "wrong") await viewWrong();
     else if (view === "fav") await viewFav();
     else if (view === "comments") await viewComments();
+    else if (view === "trial") await viewTrial();
     else if (view === "questions") await viewQuestions();
     else if (view === "accounts") await viewAccounts();
+    else if (view === "shop") await viewShopAdmin();
   } catch (e) {
     document.getElementById("main").innerHTML = '<div class="card"><h2>載入出錯</h2><p class="muted">' + esc(e.message) + '</p></div>';
   }
@@ -306,9 +328,9 @@ async function viewDashboard() {
       '<h3>難度分佈：' + a.byDifficulty.map((x) => esc(x.difficulty) + " " + x.n).join("、") + '</h3>' +
       '<h3>各考試題目分佈</h3>' + (a.byExam.length === 0 ? '<p class="muted">題庫暫時係空。</p>' : a.byExam.map((x) => '<div class="bar-row"><div class="lbl"><span>' + esc(x.exam) + '</span><span>' + x.n + ' 題</span></div><div class="bar blue"><div style="width:' + Math.max(4, Math.round((x.n / maxN) * 100)) + '%"></div></div></div>').join("")) + '</div>' +
       '<div id="analyticsCard"></div>' +
-      '<div class="card"><h2>備份與匯出（管理員）</h2><p class="muted">版本 1.2.0（2026-11-21）</p>' +
+      '<div class="card"><h2>備份與匯出（管理員）</h2><p class="muted">版本 1.3.0（2026-11-24）</p>' +
       '<p><button id="bkQ">⬇ 匯出題目 CSV（全部）</button> <button id="bkU">⬇ 匯出學生帳號 CSV</button> <button id="bkAll" class="primary">⬇ 下載成站備份 JSON</button></p>' +
-      '<p class="muted">題目 CSV 格式同匯入範本一樣，可以直接用嚟備份或者搬去另一部機。學生帳號 CSV 唔包含密碼雜湊。成站備份 JSON 包晒題目、帳號、成績、答題紀錄、留言、收藏、登入狀態、模擬考草稿同組卷模板。備份 JSON 唔包上傳咗嘅圖片／影片檔案本身，要另外經 SFTP 下載 data/uploads/ 一齊備份。</p>' +
+      '<p class="muted">題目 CSV 格式同匯入範本一樣，可以直接用嚟備份或者搬去另一部機。學生帳號 CSV 唔包含密碼雜湊。成站備份 JSON 包晒題目、帳號、成績、答題紀錄、留言、收藏、登入狀態、模擬考草稿、組卷模板、試用檔案設定、商店設定同訂單。備份 JSON 唔包上傳咗嘅圖片／影片、試用 PDF、收款二維碼同付款截圖檔案本身，要另外經 SFTP 下載 data/uploads/ 同 data/proofs/ 一齊備份。</p>' +
       '<p class="muted">⚠️ 備份檔包含密碼雜湊，唔好公開分享，妥善保存。遺失咗人哋攞到就可以離線慢慢試密碼。</p>' +
       '<p><label>還原備份 JSON</label><input type="file" id="rsFile" accept=".json,application/json"><button id="rsGo">還原備份</button></p>' +
       '<p class="muted">還原用合併方式：按編號 / 帳號逐行新增或者更新，唔會清空現有資料；失敗會成個取消，唔會還原一半。還原前建議先下載一份最新備份。</p>' +
@@ -320,7 +342,9 @@ async function viewDashboard() {
   try { myExams = (await api("/api/exams")).exams; } catch (e) { myExams = []; }
   const inProg = myExams.filter((e) => e.status !== "已完成");
   const continueHtml = '<div class="card"><h2>繼續考試</h2>' + (inProg.length === 0 ? '<p class="muted">暫時冇進行中嘅模擬考。</p>' : inProg.map((e) => '<p><b>' + esc(e.title) + '</b> · ' + e.total_questions + ' 題 <button class="primary" data-open="' + e.exam_id + '">繼續作答</button></p>').join("")) + '</div>';
-  m.innerHTML = '<h2>我嘅學習概況</h2>' + continueHtml + '<div class="grid4">' +
+  // 錯題本提醒：做完題返去錯題本針對自己錯題溫習
+  const wrongBanner = '<div class="card"><h2>錯題本提醒</h2><p>' + (stats.wrong > 0 ? '你有 <b>' + stats.wrong + ' 題</b>錯題未溫，做完題去錯題本，針對自己錯題溫習提升成績。' : '做完題記得去錯題本，針對自己錯題溫習提升成績。') + '</p><p><button class="primary" id="goW0">去錯題本溫習</button></p></div>';
+  m.innerHTML = '<h2>我嘅學習概況</h2>' + continueHtml + wrongBanner + '<div class="grid4">' +
     '<div class="stat"><div class="k">累計答題</div><div class="v">' + stats.total + '</div></div>' +
     '<div class="stat"><div class="k">整體正確率</div><div class="v">' + stats.accuracy + '%</div><div class="muted">答對 ' + stats.correct + ' 題</div></div>' +
     '<div class="stat"><div class="k">錯題本</div><div class="v">' + stats.wrong + ' 題</div><div class="muted">曾經答錯嘅題目</div></div>' +
@@ -332,6 +356,7 @@ async function viewDashboard() {
   document.getElementById("goP").addEventListener("click", () => showView("practice"));
   document.getElementById("goE").addEventListener("click", () => showView("exam"));
   document.getElementById("goW").addEventListener("click", () => showView("wrong"));
+  document.getElementById("goW0").addEventListener("click", () => showView("wrong"));
   // 備份與匯出（管理員先見到）
   const bkQ = document.getElementById("bkQ");
   if (bkQ) {
@@ -353,6 +378,144 @@ async function viewDashboard() {
   }
   // 學生表現分析（管理員先見到）
   if (me.role === "admin") renderAnalyticsCard();
+}
+
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n >= 1024 * 1024) return (Math.round(n / 1024 / 1024 * 10) / 10) + " MB";
+  return Math.round(n / 1024) + " KB";
+}
+async function viewProof(id) {
+  const token = storage.get("exam_token");
+  const res = await fetch("/api/material-orders/" + id + "/proof", { headers: token ? { Authorization: "Bearer " + token } : {} });
+  if (!res.ok) { alert("睇唔到付款截圖。"); return; }
+  const blob = await res.blob();
+  window.open(URL.createObjectURL(blob), "_blank");
+}
+
+// ---------- 下載試用 + 教材全套 ----------
+async function viewTrial() {
+  const m = mainEl();
+  m.innerHTML = '<div class="card"><h2>下載試用</h2><p class="muted">載入緊…</p></div>';
+  let files = [], shop = null, orders = [];
+  try { files = (await api("/api/trial-files")).files; } catch (e) { m.innerHTML = '<div class="card"><h2>下載試用</h2><p class="muted">' + esc(e.message) + '</p></div>'; return; }
+  try { shop = (await api("/api/shop")).shop; } catch (e) { shop = null; }
+  try { orders = (await api("/api/material-orders/mine")).orders; } catch (e) { orders = []; }
+  const filesHtml = files.length === 0 ? '<p class="muted">暫時未有試用檔案。</p>' : files.map((f) => '<div class="by-row"><div style="flex:1;min-width:180px"><b>' + esc(f.title) + '</b><div class="muted">' + esc(f.description || "") + ' · ' + fmtBytes(f.size_bytes) + '</div></div><button class="primary" data-dl="' + esc(f.url) + '" data-name="' + esc(f.original_name) + '">⬇ 下載 PDF</button></div>').join("");
+  let shopHtml = "";
+  if (!shop) shopHtml = '<p class="muted">商店資料載入失敗。</p>';
+  else if (!shop.configured) shopHtml = '<h3>' + esc(shop.title) + ' · MOP' + shop.price + '</h3><p>' + esc(shop.description || "") + '</p><p class="muted">全套即將上架，管理員準備緊付款資料，請聯絡管理員查詢。</p>';
+  else {
+    shopHtml = '<h3>' + esc(shop.title) + ' · MOP' + shop.price + '</h3><p>' + esc(shop.description || "MOP48 一個提取碼，全部內容任下載，永久更新。百度網盤。") + '</p>' +
+      '<p class="muted">付款方法：掃下面二維碼付款（MPay 或者銀行 App），之後喺訂單上傳付款截圖，管理員確認後你喺呢度即刻睇到百度網盤連結同提取碼。</p>' +
+      '<div style="display:flex;gap:16px;flex-wrap:wrap">' + (shop.mpay_qr ? '<div><div class="muted">MPay 收款碼</div><img src="' + esc(shop.mpay_qr) + '" alt="MPay 收款碼" style="max-width:200px;width:100%"></div>' : "") + (shop.bank_qr ? '<div><div class="muted">銀行收款碼</div><img src="' + esc(shop.bank_qr) + '" alt="銀行收款碼" style="max-width:200px;width:100%"></div>' : "") + '</div>' +
+      '<label>電郵地址（用嚟收百度連結同提取碼）</label><input id="ordEmail" type="email" placeholder="例如 you@example.com"><p><button class="primary" id="ordGo">落單（MOP' + shop.price + '）</button> <span id="ordMsg" class="muted"></span></p>';
+  }
+  const ordersHtml = orders.length === 0 ? '<p class="muted">你暫時未落過單。</p>' : orders.map((o) => {
+    let extra = "";
+    if (o.status === "已確認" && o.baidu_url) extra = '<p><b>百度網盤連結：</b><a href="' + esc(o.baidu_url) + '" target="_blank" rel="noopener">' + esc(o.baidu_url) + '</a><br><b>提取碼：</b>' + esc(o.baidu_code || "") + '</p><p class="muted">永久更新：之後有新教材會放喺同一個網盤資料夾，開返同一連結就下載到。</p>';
+    else if (o.status === "待確認") extra = '<p class="muted">等管理員確認付款。已付款未上傳截圖？請喺下面上傳。</p><p><label>上傳付款截圖</label><input type="file" id="proof-' + o.order_id + '" accept="image/*"><button data-proof="' + o.order_id + '">上傳截圖</button> <span class="muted">' + (o.has_proof ? '已上傳截圖，等緊確認。' : '') + '</span></p>';
+    else if (o.status === "已取消") extra = '<p class="muted">呢張訂單已取消。</p>';
+    return '<div class="by-row"><div style="flex:1;min-width:180px"><b>訂單 #' + o.order_id + '</b> · ' + esc(o.email) + ' · MOP' + o.price + ' · ' + esc(o.status) + '<div class="muted">' + esc(o.created_at || "") + '</div></div></div>' + extra;
+  }).join("");
+  m.innerHTML = '<div class="card"><h2>下載試用</h2><p class="muted">免費下載法例頭三部試用版，睇啱先買全套。</p>' + filesHtml + '</div>' +
+    '<div class="card"><h2>教材全套（百度網盤）</h2>' + shopHtml + '</div>' +
+    '<div class="card"><h2>我嘅訂單</h2>' + ordersHtml + '</div>';
+  m.querySelectorAll("[data-dl]").forEach((b) => b.addEventListener("click", async () => { try { await downloadFile(b.dataset.dl, b.dataset.name); } catch (e) { alert(e.message); } }));
+  const ordGo = document.getElementById("ordGo");
+  if (ordGo) ordGo.addEventListener("click", async () => {
+    const msg = document.getElementById("ordMsg");
+    try {
+      const d = await api("/api/material-orders", { method: "POST", body: { email: document.getElementById("ordEmail").value } });
+      alert("落單成功（訂單 #" + d.order.order_id + "），請掃碼付款再上傳截圖。");
+      showView("trial");
+    } catch (e) { msg.textContent = e.message; }
+  });
+  m.querySelectorAll("[data-proof]").forEach((b) => b.addEventListener("click", async () => {
+    const id = b.dataset.proof;
+    const f = document.getElementById("proof-" + id).files[0];
+    if (!f) { alert("請先揀一張付款截圖。"); return; }
+    const fd = new FormData(); fd.append("file", f);
+    try { await uploadFile("/api/material-orders/" + id + "/proof", fd); alert("截圖已上傳，等管理員確認。"); showView("trial"); }
+    catch (e) { alert(e.message); }
+  }));
+}
+
+// ---------- 教材商店管理（管理員） ----------
+async function viewShopAdmin() {
+  const m = mainEl();
+  let shop = null, files = [], orders = [];
+  try { shop = (await api("/api/admin/shop")).shop; } catch (e) { m.innerHTML = '<div class="card"><h2>教材商店</h2><p class="muted">' + esc(e.message) + '</p></div>'; return; }
+  try { files = (await api("/api/trial-files")).files; } catch (e) { files = []; }
+  try { orders = (await api("/api/admin/material-orders")).orders; } catch (e) { orders = []; }
+  m.innerHTML =
+    '<div class="card"><h2>教材商店（管理員）</h2><p class="muted">版本 1.3.0。呢度設定網盤全套價錢、百度連結同提取碼、上載收款二維碼、管理試用檔案同確認訂單。百度連結同提取碼未填之前，買家落唔到單。</p>' +
+    '<label>商品標題</label><input id="shTitle" value="' + esc(shop.title) + '">' +
+    '<label>價錢（MOP）</label><input id="shPrice" type="number" min="0" step="1" value="' + shop.price + '">' +
+    '<label>簡介</label><textarea id="shDesc">' + esc(shop.description || "") + '</textarea>' +
+    '<label>百度網盤連結</label><input id="shUrl" value="' + esc(shop.baidu_url || "") + '" placeholder="https://pan.baidu.com/s/...">' +
+    '<label>百度提取碼</label><input id="shCode" value="' + esc(shop.baidu_code || "") + '">' +
+    '<p><button class="primary" id="shSave">儲存設定</button> <span id="shMsg" class="muted"></span></p>' +
+    '<h3>收款二維碼</h3>' +
+    '<p>' + (shop.mpay_qr ? '<img src="' + esc(shop.mpay_qr) + '" alt="MPay 收款碼" style="max-width:200px;width:100%">' : '<span class="muted">未上載 MPay 收款碼。</span>') + ' <input type="file" id="qrMpay" accept="image/*"> <button data-qr="mpay">上載 MPay 碼</button></p>' +
+    '<p>' + (shop.bank_qr ? '<img src="' + esc(shop.bank_qr) + '" alt="銀行收款碼" style="max-width:200px;width:100%">' : '<span class="muted">未上載銀行收款碼。</span>') + ' <input type="file" id="qrBank" accept="image/*"> <button data-qr="bank">上載銀行碼</button></p></div>' +
+    '<div class="card"><h2>試用檔案管理</h2>' + (files.length === 0 ? '<p class="muted">暫時未有試用檔案。</p>' : files.map((f) => '<div class="by-row"><div style="flex:1;min-width:180px"><b>' + esc(f.title) + '</b><div class="muted">' + esc(f.original_name) + ' · ' + fmtBytes(f.size_bytes) + '</div><label>標題</label><input id="tfTitle-' + f.file_id + '" value="' + esc(f.title) + '"><label>簡介</label><input id="tfDesc-' + f.file_id + '" value="' + esc(f.description || "") + '"></div><div><button data-tf-save="' + f.file_id + '">儲存</button> <button data-tf-del="' + f.file_id + '" class="danger">刪除</button><br><label>替換 PDF</label><input type="file" id="tfFile-' + f.file_id + '" accept=".pdf,application/pdf"><button data-tf-rep="' + f.file_id + '">上載替換</button></div></div>').join("")) +
+    '<h3>新增試用檔案</h3><label>標題</label><input id="tfNewTitle" placeholder="例如：第 4 部：行政程序法典（試用版）"><label>簡介</label><input id="tfNewDesc"><label>PDF 檔案</label><input type="file" id="tfNewFile" accept=".pdf,application/pdf"><p><button class="primary" id="tfAdd">上載新增</button> <span id="tfMsg" class="muted"></span></p></div>' +
+    '<div class="card"><h2>訂單管理</h2>' + (orders.length === 0 ? '<p class="muted">暫時未有訂單。</p>' : orders.map((o) => '<div class="by-row"><div style="flex:1;min-width:180px"><b>訂單 #' + o.order_id + '</b> · ' + esc(o.username || "") + ' · ' + esc(o.email) + ' · MOP' + o.price + ' · ' + esc(o.status) + '<div class="muted">' + esc(o.created_at || "") + '</div></div><div>' + (o.has_proof ? '<button data-proof-view="' + o.order_id + '">睇付款截圖</button> ' : '<span class="muted">未上傳截圖</span> ') + (o.status === "待確認" ? '<button class="primary" data-ord-ok="' + o.order_id + '">確認收款</button> <button data-ord-no="' + o.order_id + '" class="danger">取消</button>' : "") + '</div></div>').join("")) + '</div>';
+  document.getElementById("shSave").addEventListener("click", async () => {
+    const msg = document.getElementById("shMsg");
+    try {
+      await api("/api/admin/shop", { method: "PUT", body: { price: Number(document.getElementById("shPrice").value), title: document.getElementById("shTitle").value, description: document.getElementById("shDesc").value, baidu_url: document.getElementById("shUrl").value, baidu_code: document.getElementById("shCode").value } });
+      msg.textContent = "已儲存。";
+    } catch (e) { msg.textContent = e.message; }
+  });
+  m.querySelectorAll("[data-qr]").forEach((b) => b.addEventListener("click", async () => {
+    const kind = b.dataset.qr;
+    const f = document.getElementById(kind === "mpay" ? "qrMpay" : "qrBank").files[0];
+    if (!f) { alert("請先揀一個二維碼圖片。"); return; }
+    const fd = new FormData(); fd.append("file", f);
+    try { await uploadFile("/api/admin/shop/qr?kind=" + kind, fd); alert("二維碼已上載。"); showView("shop"); }
+    catch (e) { alert(e.message); }
+  }));
+  m.querySelectorAll("[data-tf-save]").forEach((b) => b.addEventListener("click", async () => {
+    const id = b.dataset.tfSave;
+    try { await api("/api/admin/trial-files/" + id, { method: "PUT", body: { title: document.getElementById("tfTitle-" + id).value, description: document.getElementById("tfDesc-" + id).value } }); alert("已儲存。"); }
+    catch (e) { alert(e.message); }
+  }));
+  m.querySelectorAll("[data-tf-del]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("確定刪除呢個試用檔案？")) return;
+    try { await api("/api/admin/trial-files/" + b.dataset.tfDel, { method: "DELETE" }); showView("shop"); }
+    catch (e) { alert(e.message); }
+  }));
+  m.querySelectorAll("[data-tf-rep]").forEach((b) => b.addEventListener("click", async () => {
+    const id = b.dataset.tfRep;
+    const f = document.getElementById("tfFile-" + id).files[0];
+    if (!f) { alert("請先揀一個 PDF。"); return; }
+    const fd = new FormData(); fd.append("file", f);
+    try { await uploadFile("/api/admin/trial-files/" + id + "/replace", fd); alert("已替換。"); showView("shop"); }
+    catch (e) { alert(e.message); }
+  }));
+  document.getElementById("tfAdd").addEventListener("click", async () => {
+    const msg = document.getElementById("tfMsg");
+    const f = document.getElementById("tfNewFile").files[0];
+    if (!f) { msg.textContent = "請先揀一個 PDF。"; return; }
+    const fd = new FormData();
+    fd.append("file", f);
+    fd.append("title", document.getElementById("tfNewTitle").value);
+    fd.append("description", document.getElementById("tfNewDesc").value);
+    try { await uploadFile("/api/admin/trial-files", fd); alert("已新增。"); showView("shop"); }
+    catch (e) { msg.textContent = e.message; }
+  });
+  m.querySelectorAll("[data-proof-view]").forEach((b) => b.addEventListener("click", () => viewProof(b.dataset.proofView)));
+  m.querySelectorAll("[data-ord-ok]").forEach((b) => b.addEventListener("click", async () => {
+    try { await api("/api/admin/material-orders/" + b.dataset.ordOk + "/confirm", { method: "POST" }); showView("shop"); }
+    catch (e) { alert(e.message); }
+  }));
+  m.querySelectorAll("[data-ord-no]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("確定取消呢張訂單？")) return;
+    try { await api("/api/admin/material-orders/" + b.dataset.ordNo + "/cancel", { method: "POST" }); showView("shop"); }
+    catch (e) { alert(e.message); }
+  }));
 }
 
 // ---------- 刷題 ----------

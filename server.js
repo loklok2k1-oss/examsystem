@@ -20,6 +20,7 @@ try {
 }
 
 const PORT = process.env.PORT || 3000;
+const VERSION = "1.3.0";
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "exam.db");
@@ -109,6 +110,37 @@ db.exec(`
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS trial_files (
+    file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    filename TEXT NOT NULL,
+    original_name TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS shop_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    price INTEGER NOT NULL DEFAULT 48,
+    title TEXT NOT NULL DEFAULT '430 教材全套',
+    description TEXT NOT NULL DEFAULT '',
+    baidu_url TEXT NOT NULL DEFAULT '',
+    baidu_code TEXT NOT NULL DEFAULT '',
+    mpay_qr TEXT NOT NULL DEFAULT '',
+    bank_qr TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS material_orders (
+    order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    price INTEGER NOT NULL DEFAULT 48,
+    status TEXT NOT NULL DEFAULT '待確認',
+    proof_path TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT
+  );
 `);
 
 // ---------- 遷移：舊資料庫嘅 questions 表加 media 欄位 ----------
@@ -148,6 +180,53 @@ function seedIfEmpty() {
   console.log("已寫入種子題目：Test-001（一條試驗題，等你之後用 CSV 匯入更多 VTS / 430 題）。");
 }
 seedIfEmpty();
+
+// ---------- v1.3.0：教材商店（下載試用 + 手動支付） ----------
+// 試用檔案存 data/uploads/trial/，經 /uploads 公開下載（免費試用檔案）。
+// 收款二維碼存 data/uploads/shop/，公開顯示（付款碼本身就係公開嘅）。
+// 付款截圖存 data/proofs/（唔經 /uploads 公開掛出），只有買家本人同管理員經接口睇到。
+const TRIAL_DIR = path.join(UPLOAD_DIR, "trial");
+const SHOP_DIR = path.join(UPLOAD_DIR, "shop");
+const PROOF_DIR = path.join(DATA_DIR, "proofs");
+fs.mkdirSync(TRIAL_DIR, { recursive: true });
+fs.mkdirSync(SHOP_DIR, { recursive: true });
+fs.mkdirSync(PROOF_DIR, { recursive: true });
+const TRIAL_SEED = [
+  { file: "study-law-01-basic-law-tri.pdf", title: "第 1 部：澳門特別行政區基本法（試用版）", description: "法例重點筆記試用版，3 頁。" },
+  { file: "study-law-02-constitution-tri.pdf", title: "第 2 部：中華人民共和國憲法（試用版）", description: "法例重點筆記試用版，3 頁。" },
+  { file: "study-law-03-nsa-tri.pdf", title: "第 3 部：維護國家安全法（試用版）", description: "法例重點筆記試用版，3 頁。" },
+];
+function ensureShopSettings() {
+  db.prepare("INSERT OR IGNORE INTO shop_settings (id, price, title, description, baidu_url, baidu_code, mpay_qr, bank_qr, updated_at) VALUES (1, 48, '430 教材全套', 'MOP48 一個提取碼，全部內容任下載，永久更新。百度網盤。', '', '', '', '', ?)").run(nowIso());
+}
+function ensureDemoAccount() {
+  // 示範帳號 test/test：免註冊試用。共用帳號，記錄會同其他試用者混埋一齊。
+  // 資料庫未有任何帳號嗰陣唔建立，否則第一個註冊嘅人唔會變成管理員。
+  const total = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
+  if (total === 0) return;
+  const exists = db.prepare("SELECT 1 FROM users WHERE username = ?").get("test");
+  if (!exists) {
+    db.prepare("INSERT INTO users (username, password_hash, role, created_at) VALUES (?,?,?,?)").run("test", hashPassword("test"), "user", nowIso());
+    console.log("已建立示範帳號 test（密碼 test，免註冊試用，共用帳號）。");
+  }
+}
+function seedTrialFiles() {
+  const n = db.prepare("SELECT COUNT(*) AS n FROM trial_files").get().n;
+  if (n > 0) return;
+  const seedDir = path.join(ROOT, "seed-trial");
+  for (const s of TRIAL_SEED) {
+    const src = path.join(seedDir, s.file);
+    if (!fs.existsSync(src)) continue;
+    const stored = crypto.randomBytes(16).toString("hex") + ".pdf";
+    try { fs.copyFileSync(src, path.join(TRIAL_DIR, stored)); } catch (e) { continue; }
+    const size = fs.statSync(path.join(TRIAL_DIR, stored)).size;
+    db.prepare("INSERT INTO trial_files (title, description, filename, original_name, size_bytes, created_at, updated_at) VALUES (?,?,?,?,?,?,?)").run(s.title, s.description, stored, s.file, size, nowIso(), nowIso());
+  }
+  console.log("已寫入試用檔案：法例頭三部試用版 PDF。");
+}
+ensureShopSettings();
+ensureDemoAccount();
+seedTrialFiles();
 
 // ---------- 小工具 ----------
 function nowIso() { return new Date().toISOString(); }
@@ -527,10 +606,11 @@ function createSessionFor(userId) {
 }
 
 app.get(["/health", "/api/health"], (req, res) => {
-  res.json({ ok: true, app: "exam-system-standalone", version: "1.2.0", time: nowIso() });
+  res.json({ ok: true, app: "exam-system-standalone", version: VERSION, time: nowIso() });
 });
 
 app.get("/api/bootstrap", (req, res) => {
+  ensureDemoAccount();
   const n = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
   res.json({ configured: n > 0, hasAdmin: n > 0, userCount: n });
 });
@@ -635,6 +715,186 @@ app.post("/api/upload", requireAuth, requireAdmin, (req, res) => {
     }
     res.json({ url: "/uploads/" + req.file.filename, type });
   });
+});
+
+// ---------- v1.3.0：教材商店（下載試用 + 手動支付） ----------
+// 流程：買家落單（填電郵）→ 掃 MPay／銀行收款碼付款 → 上傳付款截圖 →
+// 管理員確認 → 買家喺「我嘅訂單」即刻睇到百度網盤連結同提取碼。
+// 百度連結同提取碼只有已確認嘅訂單先見到，公開接口唔會回傳。
+const trialUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, TRIAL_DIR),
+    filename: (req, file, cb) => cb(null, crypto.randomBytes(16).toString("hex") + ".pdf"),
+  }),
+  fileFilter: (req, file, cb) => {
+    if (path.extname(file.originalname || "").toLowerCase() === ".pdf") return cb(null, true);
+    cb(new Error("試用檔案只接受 PDF。"));
+  },
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
+const qrUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, SHOP_DIR),
+    filename: (req, file, cb) => cb(null, crypto.randomBytes(16).toString("hex") + path.extname(file.originalname || "").toLowerCase()),
+  }),
+  fileFilter: (req, file, cb) => {
+    if (IMAGE_EXTS.has(path.extname(file.originalname || "").toLowerCase())) return cb(null, true);
+    cb(new Error("二維碼只接受圖片（jpg / jpeg / png / gif / webp）。"));
+  },
+  limits: { fileSize: IMAGE_MAX_BYTES },
+});
+const proofUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, PROOF_DIR),
+    filename: (req, file, cb) => cb(null, crypto.randomBytes(16).toString("hex") + path.extname(file.originalname || "").toLowerCase()),
+  }),
+  fileFilter: (req, file, cb) => {
+    if (IMAGE_EXTS.has(path.extname(file.originalname || "").toLowerCase())) return cb(null, true);
+    cb(new Error("付款截圖只接受圖片（jpg / jpeg / png / gif / webp）。"));
+  },
+  limits: { fileSize: IMAGE_MAX_BYTES },
+});
+function publicShopRow() {
+  const s = db.prepare("SELECT * FROM shop_settings WHERE id = 1").get();
+  if (!s) return { price: 48, title: "430 教材全套", description: "", mpay_qr: "", bank_qr: "", configured: false };
+  return { price: s.price, title: s.title, description: s.description, mpay_qr: s.mpay_qr, bank_qr: s.bank_qr, configured: Boolean(s.baidu_url && s.baidu_code) };
+}
+function orderRow(o, includeLink) {
+  const out = { order_id: o.order_id, user_id: o.user_id, email: o.email, price: o.price, status: o.status, has_proof: Boolean(o.proof_path), created_at: o.created_at, confirmed_at: o.confirmed_at };
+  if (includeLink && o.status === "已確認") {
+    const s = db.prepare("SELECT baidu_url, baidu_code FROM shop_settings WHERE id = 1").get();
+    out.baidu_url = s ? s.baidu_url : "";
+    out.baidu_code = s ? s.baidu_code : "";
+  }
+  return out;
+}
+// 商店公開資料（價錢、收款碼）：唔包百度連結同提取碼
+app.get("/api/shop", (req, res) => { res.json({ shop: publicShopRow() }); });
+// 試用檔案清單（要登入）
+app.get("/api/trial-files", requireAuth, (req, res) => {
+  const rows = db.prepare("SELECT * FROM trial_files ORDER BY file_id").all();
+  res.json({ files: rows.map((r) => ({ file_id: r.file_id, title: r.title, description: r.description, original_name: r.original_name, size_bytes: r.size_bytes, url: "/uploads/trial/" + r.filename })) });
+});
+// 我嘅訂單（已確認先至見到百度連結同提取碼）
+app.get("/api/material-orders/mine", requireAuth, (req, res) => {
+  const rows = db.prepare("SELECT * FROM material_orders WHERE user_id = ? ORDER BY order_id DESC").all(req.user.user_id);
+  res.json({ orders: rows.map((o) => orderRow(o, true)) });
+});
+app.post("/api/material-orders", requireAuth, (req, res) => {
+  const email = String(req.body.email || "").trim();
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "請填寫正確嘅電郵地址，付款確認後會用嚟寄百度連結同提取碼。" });
+  const shop = publicShopRow();
+  if (!shop.configured) return res.status(400).json({ error: "教材全套未上架（管理員未填百度連結同提取碼），請聯絡管理員。" });
+  const info = db.prepare("INSERT INTO material_orders (user_id, email, price, status, created_at) VALUES (?,?,?,?,?)").run(req.user.user_id, email, shop.price, "待確認", nowIso());
+  res.json({ ok: true, order: orderRow(db.prepare("SELECT * FROM material_orders WHERE order_id = ?").get(info.lastInsertRowid), false) });
+});
+app.post("/api/material-orders/:id/proof", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const o = db.prepare("SELECT * FROM material_orders WHERE order_id = ?").get(id);
+  if (!o) return res.status(404).json({ error: "搵唔到呢張訂單。" });
+  if (o.user_id !== req.user.user_id) return res.status(403).json({ error: "只可以上傳自己訂單嘅付款截圖。" });
+  proofUpload.single("file")(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "圖片唔可以超過 5 MB。" : (err.message || "上傳失敗。") });
+    if (!req.file) return res.status(400).json({ error: "請揀一張付款截圖上傳。" });
+    if (o.proof_path) { const old = path.join(PROOF_DIR, path.basename(o.proof_path)); fs.unlink(old, () => {}); }
+    db.prepare("UPDATE material_orders SET proof_path = ? WHERE order_id = ?").run(req.file.filename, id);
+    res.json({ ok: true });
+  });
+});
+// 付款截圖（買家本人或者管理員先睇到）
+app.get("/api/material-orders/:id/proof", requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const o = db.prepare("SELECT * FROM material_orders WHERE order_id = ?").get(id);
+  if (!o) return res.status(404).json({ error: "搵唔到呢張訂單。" });
+  if (o.user_id !== req.user.user_id && req.user.role !== "admin") return res.status(403).json({ error: "冇權限睇呢張付款截圖。" });
+  if (!o.proof_path) return res.status(404).json({ error: "呢張訂單未上傳付款截圖。" });
+  const p = path.join(PROOF_DIR, path.basename(o.proof_path));
+  if (!fs.existsSync(p)) return res.status(404).json({ error: "付款截圖檔案唔見咗。" });
+  res.sendFile(p);
+});
+// ---------- 教材商店管理（管理員） ----------
+app.get("/api/admin/shop", requireAuth, requireAdmin, (req, res) => {
+  const s = db.prepare("SELECT * FROM shop_settings WHERE id = 1").get();
+  res.json({ shop: s || { price: 48, title: "430 教材全套", description: "", baidu_url: "", baidu_code: "", mpay_qr: "", bank_qr: "" } });
+});
+app.put("/api/admin/shop", requireAuth, requireAdmin, (req, res) => {
+  const price = Number(req.body.price);
+  if (!Number.isInteger(price) || price < 0) return res.status(400).json({ error: "價錢要係 0 或者以上嘅整數。" });
+  const title = String(req.body.title || "").trim();
+  if (!title) return res.status(400).json({ error: "請填寫商品標題。" });
+  db.prepare("UPDATE shop_settings SET price = ?, title = ?, description = ?, baidu_url = ?, baidu_code = ?, updated_at = ? WHERE id = 1")
+    .run(price, title, String(req.body.description || "").trim(), String(req.body.baidu_url || "").trim(), String(req.body.baidu_code || "").trim(), nowIso());
+  res.json({ ok: true });
+});
+app.post("/api/admin/shop/qr", requireAuth, requireAdmin, (req, res) => {
+  const kind = String(req.query.kind || "");
+  if (kind !== "mpay" && kind !== "bank") return res.status(400).json({ error: "kind 只可以係 mpay 或者 bank。" });
+  qrUpload.single("file")(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "圖片唔可以超過 5 MB。" : (err.message || "上傳失敗。") });
+    if (!req.file) return res.status(400).json({ error: "請揀一個二維碼圖片上傳。" });
+    const col = kind === "mpay" ? "mpay_qr" : "bank_qr";
+    const old = db.prepare("SELECT " + col + " AS v FROM shop_settings WHERE id = 1").get();
+    const url = "/uploads/shop/" + req.file.filename;
+    db.prepare("UPDATE shop_settings SET " + col + " = ?, updated_at = ? WHERE id = 1").run(url, nowIso());
+    if (old && old.v) { const op = path.join(SHOP_DIR, path.basename(old.v)); fs.unlink(op, () => {}); }
+    res.json({ ok: true, url });
+  });
+});
+app.get("/api/admin/material-orders", requireAuth, requireAdmin, (req, res) => {
+  const rows = db.prepare("SELECT o.*, u.username FROM material_orders o LEFT JOIN users u ON u.user_id = o.user_id ORDER BY o.order_id DESC").all();
+  res.json({ orders: rows.map((o) => Object.assign(orderRow(o, false), { username: o.username || "" })) });
+});
+app.post("/api/admin/material-orders/:id/confirm", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const o = db.prepare("SELECT * FROM material_orders WHERE order_id = ?").get(id);
+  if (!o) return res.status(404).json({ error: "搵唔到呢張訂單。" });
+  const shop = publicShopRow();
+  if (!shop.configured) return res.status(400).json({ error: "未填百度連結同提取碼，確認之前請先去商店設定填好。" });
+  db.prepare("UPDATE material_orders SET status = '已確認', confirmed_at = ? WHERE order_id = ?").run(nowIso(), id);
+  res.json({ ok: true });
+});
+app.post("/api/admin/material-orders/:id/cancel", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  db.prepare("UPDATE material_orders SET status = '已取消' WHERE order_id = ?").run(id);
+  res.json({ ok: true });
+});
+app.post("/api/admin/trial-files", requireAuth, requireAdmin, (req, res) => {
+  trialUpload.single("file")(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "PDF 唔可以超過 10 MB。" : (err.message || "上傳失敗。") });
+    if (!req.file) return res.status(400).json({ error: "請揀一個 PDF 上傳。" });
+    const title = String(req.body.title || "").trim() || req.file.originalname;
+    const description = String(req.body.description || "").trim();
+    const info = db.prepare("INSERT INTO trial_files (title, description, filename, original_name, size_bytes, created_at, updated_at) VALUES (?,?,?,?,?,?,?)").run(title, description, req.file.filename, req.file.originalname, req.file.size, nowIso(), nowIso());
+    res.json({ ok: true, file_id: info.lastInsertRowid });
+  });
+});
+app.put("/api/admin/trial-files/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const title = String(req.body.title || "").trim();
+  if (!title) return res.status(400).json({ error: "請填寫標題。" });
+  db.prepare("UPDATE trial_files SET title = ?, description = ?, updated_at = ? WHERE file_id = ?").run(title, String(req.body.description || "").trim(), nowIso(), id);
+  res.json({ ok: true });
+});
+app.post("/api/admin/trial-files/:id/replace", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare("SELECT * FROM trial_files WHERE file_id = ?").get(id);
+  if (!row) return res.status(404).json({ error: "搵唔到呢個試用檔案。" });
+  trialUpload.single("file")(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "PDF 唔可以超過 10 MB。" : (err.message || "上傳失敗。") });
+    if (!req.file) return res.status(400).json({ error: "請揀一個 PDF 上傳。" });
+    const old = path.join(TRIAL_DIR, path.basename(row.filename));
+    fs.unlink(old, () => {});
+    db.prepare("UPDATE trial_files SET filename = ?, original_name = ?, size_bytes = ?, updated_at = ? WHERE file_id = ?").run(req.file.filename, req.file.originalname, req.file.size, nowIso(), id);
+    res.json({ ok: true });
+  });
+});
+app.delete("/api/admin/trial-files/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db.prepare("SELECT * FROM trial_files WHERE file_id = ?").get(id);
+  if (!row) return res.status(404).json({ error: "搵唔到呢個試用檔案。" });
+  db.prepare("DELETE FROM trial_files WHERE file_id = ?").run(id);
+  fs.unlink(path.join(TRIAL_DIR, path.basename(row.filename)), () => {});
+  res.json({ ok: true });
 });
 
 // ---------- 題庫 ----------
@@ -1385,6 +1645,9 @@ app.get("/api/admin/backup", requireAuth, requireAdmin, (req, res) => {
     sessions: db.prepare("SELECT * FROM sessions ORDER BY created_at").all(),
     exam_progress: db.prepare("SELECT * FROM exam_progress ORDER BY exam_id").all(),
     paper_templates: db.prepare("SELECT * FROM paper_templates ORDER BY template_id").all(),
+    trial_files: db.prepare("SELECT * FROM trial_files ORDER BY file_id").all(),
+    shop_settings: db.prepare("SELECT * FROM shop_settings ORDER BY id").all(),
+    material_orders: db.prepare("SELECT * FROM material_orders ORDER BY order_id").all(),
   };
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Content-Disposition", 'attachment; filename="exam-backup-' + dateStamp() + '.json"');
@@ -1395,7 +1658,7 @@ app.get("/api/admin/backup", requireAuth, requireAdmin, (req, res) => {
 app.post("/api/admin/restore", requireAuth, requireAdmin, (req, res) => {
   const b = req.body && req.body.backup ? req.body.backup : req.body;
   if (!b || typeof b !== "object" || Array.isArray(b)) return res.status(400).json({ error: "備份檔案格式唔啱，請上載由呢個系統匯出嘅備份 JSON。" });
-  const tables = ["questions", "users", "exam_records", "answer_records", "comments", "favorites", "sessions", "exam_progress", "paper_templates"];
+  const tables = ["questions", "users", "exam_records", "answer_records", "comments", "favorites", "sessions", "exam_progress", "paper_templates", "trial_files", "shop_settings", "material_orders"];
   for (const t of tables) {
     if (b[t] != null && !Array.isArray(b[t])) return res.status(400).json({ error: "備份檔案入面 " + t + " 唔係列表格式。" });
   }
@@ -1496,6 +1759,34 @@ app.post("/api/admin/restore", requireAuth, requireAdmin, (req, res) => {
         const exists = db.prepare("SELECT 1 FROM paper_templates WHERE template_id = ?").get(t.template_id);
         db.prepare("INSERT INTO paper_templates (template_id,title,config,created_by,created_at) VALUES (?,?,?,?,?) ON CONFLICT(template_id) DO UPDATE SET title=excluded.title, config=excluded.config, created_by=excluded.created_by, created_at=excluded.created_at")
           .run(t.template_id, t.title, typeof t.config === "string" ? t.config : JSON.stringify(t.config || []), t.created_by || 0, t.created_at || nowIso());
+        if (exists) c.updated++; else c.inserted++;
+      }
+      // 試用檔案：按 file_id upsert（舊版備份冇呢個表，b.trial_files 係 undefined 就跳過；
+      // 還原只還原設定，PDF 檔案本身要另外經 SFTP 備份 data/uploads/trial/）
+      for (const t of b.trial_files || []) {
+        const c = count("trial_files");
+        if (!t || typeof t !== "object" || t.file_id == null || !t.title || !t.filename) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM trial_files WHERE file_id = ?").get(t.file_id);
+        db.prepare("INSERT INTO trial_files (file_id,title,description,filename,original_name,size_bytes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET title=excluded.title, description=excluded.description, filename=excluded.filename, original_name=excluded.original_name, size_bytes=excluded.size_bytes, created_at=excluded.created_at, updated_at=excluded.updated_at")
+          .run(t.file_id, t.title, t.description || "", t.filename, t.original_name || "", t.size_bytes || 0, t.created_at || nowIso(), t.updated_at || nowIso());
+        if (exists) c.updated++; else c.inserted++;
+      }
+      // 商店設定：得一行（id = 1），有就更新，冇就插入
+      for (const s of b.shop_settings || []) {
+        const c = count("shop_settings");
+        if (!s || typeof s !== "object") { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM shop_settings WHERE id = 1").get();
+        db.prepare("INSERT INTO shop_settings (id,price,title,description,baidu_url,baidu_code,mpay_qr,bank_qr,updated_at) VALUES (1,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET price=excluded.price, title=excluded.title, description=excluded.description, baidu_url=excluded.baidu_url, baidu_code=excluded.baidu_code, mpay_qr=excluded.mpay_qr, bank_qr=excluded.bank_qr, updated_at=excluded.updated_at")
+          .run(s.price == null ? 48 : s.price, s.title || "430 教材全套", s.description || "", s.baidu_url || "", s.baidu_code || "", s.mpay_qr || "", s.bank_qr || "", s.updated_at || nowIso());
+        if (exists) c.updated++; else c.inserted++;
+      }
+      // 訂單：按 order_id upsert
+      for (const o of b.material_orders || []) {
+        const c = count("material_orders");
+        if (!o || typeof o !== "object" || o.order_id == null || o.user_id == null || !o.email) { c.skipped++; continue; }
+        const exists = db.prepare("SELECT 1 FROM material_orders WHERE order_id = ?").get(o.order_id);
+        db.prepare("INSERT INTO material_orders (order_id,user_id,email,price,status,proof_path,created_at,confirmed_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET user_id=excluded.user_id, email=excluded.email, price=excluded.price, status=excluded.status, proof_path=excluded.proof_path, created_at=excluded.created_at, confirmed_at=excluded.confirmed_at")
+          .run(o.order_id, o.user_id, o.email, o.price == null ? 48 : o.price, o.status || "待確認", o.proof_path || "", o.created_at || nowIso(), o.confirmed_at || null);
         if (exists) c.updated++; else c.inserted++;
       }
       // 模擬考草稿：按 exam_id upsert
